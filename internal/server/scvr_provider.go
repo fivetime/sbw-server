@@ -21,16 +21,26 @@ type scvrProvider struct{ cp *ControlPlane }
 func (p *scvrProvider) Report(ctx context.Context, r *rpc.CovererReport) error {
 	switch r.Kind {
 	case rpc.CovererReport_DEATH_VOTE:
-		// Each coverer's tap PeerDown/PeerUp is a PER-COVERER vote: feed it to the Monitor
-		// keyed by r.CovererId so FailoverQuorum is corroborated ACROSS the K coverers.
-		// cp.HardDown (the monolith path) would record ONE server-local vote and discard
-		// CovererId — collapsing K coverers into a single vote so quorum>1 could never form.
-		// (The coverer MUST set CovererId — see sbw-coverer reportDeathVote. Cross-server-
-		// replica corroboration via the etcd deathvote bridge is the step-11 decision.)
-		if r.CovererId == "" {
-			p.cp.log.Warn("death-vote report missing coverer_id (quorum cannot corroborate)", "edge", r.EdgeId)
+		edge := model.EdgeID(r.EdgeId)
+		if r.Soft {
+			// SOFT canary signal (DESIGN-liveness §4.7): the canary route withdrawn/restored.
+			// It only fails over IN CONJUNCTION with an agent data-plane-death report, so it
+			// drives the Monitor's canary path, NOT the hard FailoverQuorum.
+			if r.Down {
+				p.cp.Liveness.CanaryDown(edge)
+			} else {
+				p.cp.Liveness.CanaryUp(edge)
+			}
+		} else {
+			// HARD session vote: each coverer's PeerDown/Up is a PER-COVERER vote keyed by
+			// r.CovererId so FailoverQuorum corroborates ACROSS the K coverers (cp.HardDown
+			// would collapse them into one server-local vote). Cross-server-replica
+			// corroboration via the etcd deathvote bridge is the step-11 decision.
+			if r.CovererId == "" {
+				p.cp.log.Warn("hard death-vote report missing coverer_id (quorum cannot corroborate)", "edge", r.EdgeId)
+			}
+			p.cp.Liveness.Vote(edge, r.CovererId, r.Down)
 		}
-		p.cp.Liveness.Vote(model.EdgeID(r.EdgeId), r.CovererId, r.Down)
 	case rpc.CovererReport_AGENT_REPORT:
 		// the agent's EdgeReport (health/capacity/metering-echo) — process it on the
 		// server half (heartbeat, soft-death, convergence resolve, applied-version
