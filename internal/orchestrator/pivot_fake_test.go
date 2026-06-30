@@ -8,6 +8,7 @@ import (
 	"sync"
 
 	"github.com/fivetime/sbw-contract/model"
+
 	"github.com/fivetime/sbw-server/internal/poolstore"
 	"github.com/fivetime/sbw-server/internal/srcmap"
 	"github.com/fivetime/sbw-server/internal/ybstore"

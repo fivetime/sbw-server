@@ -71,8 +71,10 @@ type ServerConfig struct {
 	APIResultsTopic string `json:"api_results_topic"`
 }
 
-const defaultAPIResultsTopic = "sbw.api.results"
-const defaultServerCovererListenAddr = ":1792"
+const (
+	defaultAPIResultsTopic         = "sbw.api.results"
+	defaultServerCovererListenAddr = ":1792"
+)
 
 // EtcdConfig points at the etcd cluster holding COORDINATION state (registry, token
 // ledger, sharding/coverage, liveness, edgever). The bulk pool/member DATA lives in
@@ -220,6 +222,9 @@ func (c *ServerConfig) applyEnv() error {
 	}
 	if c.HomeMarker.GlobalAdmin, err = config.Uint32("HOME_MARKER_GLOBAL_ADMIN", c.HomeMarker.GlobalAdmin); err != nil {
 		return err
+	}
+	if c.HomeMarker.GlobalAdmin == 0 {
+		c.HomeMarker.GlobalAdmin = defaultHomeMarkerGlobalAdmin // 0 ⇒ the default marker GlobalAdmin
 	}
 	if c.HomeMarker.LocalData1, err = config.Uint32("HOME_MARKER_LOCAL_DATA1", c.HomeMarker.LocalData1); err != nil {
 		return err

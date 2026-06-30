@@ -9,6 +9,9 @@ import (
 
 	"github.com/fivetime/sbw-contract/metrics"
 	"github.com/fivetime/sbw-contract/model"
+	clientv3 "go.etcd.io/etcd/client/v3"
+	"google.golang.org/grpc"
+
 	"github.com/fivetime/sbw-server/internal/apiresult"
 	"github.com/fivetime/sbw-server/internal/deathvote"
 	"github.com/fivetime/sbw-server/internal/edgever"
@@ -17,8 +20,6 @@ import (
 	"github.com/fivetime/sbw-server/internal/orchestrator"
 	"github.com/fivetime/sbw-server/internal/registry"
 	"github.com/fivetime/sbw-server/internal/shard"
-	clientv3 "go.etcd.io/etcd/client/v3"
-	"google.golang.org/grpc"
 )
 
 // sellableFracPercent is the share of an agent's NIC line rate the controller may

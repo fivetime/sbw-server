@@ -25,6 +25,9 @@ import (
 	"github.com/fivetime/sbw-contract/metrics"
 	"github.com/fivetime/sbw-contract/model"
 	"github.com/fivetime/sbw-contract/rpc"
+	clientv3 "go.etcd.io/etcd/client/v3"
+	"google.golang.org/grpc"
+
 	"github.com/fivetime/sbw-server/internal/apiresult"
 	"github.com/fivetime/sbw-server/internal/coverage"
 	"github.com/fivetime/sbw-server/internal/ctrlreg"
@@ -32,8 +35,6 @@ import (
 	"github.com/fivetime/sbw-server/internal/edgever"
 	"github.com/fivetime/sbw-server/internal/server"
 	"github.com/fivetime/sbw-server/internal/ybstore"
-	clientv3 "go.etcd.io/etcd/client/v3"
-	"google.golang.org/grpc"
 )
 
 func main() {

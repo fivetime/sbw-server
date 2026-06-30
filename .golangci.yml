@@ -1,0 +1,46 @@
+# golangci-lint v2 config. Keep CI focused on Go code quality: correctness
+# checks, dead-code detection, bounded complexity, and mechanical formatting.
+# Avoid broad style-only linters here; they create noise without improving
+# build safety. (Kept in sync with sbw-controller/sbw-coverer.)
+version: "2"
+
+linters:
+  default: standard
+  enable:
+    # Make dead-code intent explicit. `standard` already includes unused, but
+    # keeping it here documents that CI must catch unused functions, methods,
+    # types, constants and variables.
+    - unused
+    # Catch assignments whose values are overwritten or never read.
+    - wastedassign
+    # Block functions that become too hard to reason about.
+    - gocognit
+  settings:
+    gocognit:
+      # 50 (vs the monolith's aspirational 30): the extracted core funcs
+      # (NewControlPlane, drainEdgeGen, Tick, ReconcileAnchors) are inherently
+      # complex; this still catches NEW runaway complexity without forcing a
+      # risky refactor of the shared coordination logic.
+      min-complexity: 50
+    staticcheck:
+      # -ST1000: allow missing package comments on _test files.
+      # -QF1008: keep explicit embedded-field selectors (req.Pool.ID over req.ID) —
+      #   a style quickfix, not a correctness check; the explicit form reads clearer.
+      checks: ["all", "-ST1000", "-QF1008"]
+
+formatters:
+  enable:
+    # Stricter gofmt, still mechanical and low-noise.
+    - gofumpt
+    # Enforce import grouping/order, including the local module prefix.
+    - goimports
+  settings:
+    gofumpt:
+      extra-rules: true
+    goimports:
+      local-prefixes:
+        - github.com/fivetime/sbw-server
+
+issues:
+  max-issues-per-linter: 0
+  max-same-issues: 0

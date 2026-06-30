@@ -45,6 +45,8 @@ import (
 	"time"
 
 	"github.com/fivetime/sbw-contract/model"
+	"golang.org/x/sync/singleflight"
+
 	"github.com/fivetime/sbw-server/internal/edgever"
 	"github.com/fivetime/sbw-server/internal/poolstore"
 	"github.com/fivetime/sbw-server/internal/registry"
@@ -52,7 +54,6 @@ import (
 	"github.com/fivetime/sbw-server/internal/scheduler"
 	"github.com/fivetime/sbw-server/internal/srcmap"
 	"github.com/fivetime/sbw-server/internal/ybstore"
-	"golang.org/x/sync/singleflight"
 )
 
 // Pusher ships an edge's FULL desired state downstream (grpcsrv.Server satisfies

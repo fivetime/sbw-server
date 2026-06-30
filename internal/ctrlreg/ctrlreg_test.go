@@ -136,7 +136,7 @@ func TestCrashExpiryRemoves(t *testing.T) {
 		t.Fatalf("want 1 after join, got %v", ids)
 	}
 
-	dyingCli.Close() // simulate crash: keep-alive stops, lease no longer renewed
+	_ = dyingCli.Close() // simulate crash: keep-alive stops, lease no longer renewed
 	// Wait past the TTL for etcd to expire the lease.
 	deadline := time.Now().Add(8 * time.Second)
 	for time.Now().Before(deadline) {

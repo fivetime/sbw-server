@@ -20,6 +20,7 @@ func (r *recorder) onFailover(_ context.Context, e model.EdgeID) {
 	r.failed = append(r.failed, e)
 	r.mu.Unlock()
 }
+
 func (r *recorder) onRevive(_ context.Context, e model.EdgeID) {
 	r.mu.Lock()
 	r.revived = append(r.revived, e)

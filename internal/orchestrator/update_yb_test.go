@@ -9,8 +9,9 @@ import (
 	"time"
 
 	"github.com/fivetime/sbw-contract/model"
-	"github.com/fivetime/sbw-server/internal/ybstore"
 	clientv3 "go.etcd.io/etcd/client/v3"
+
+	"github.com/fivetime/sbw-server/internal/ybstore"
 )
 
 // bulkDataKeyPrefixes are the etcd keyspaces that hold PER-POOL bulk DATA — the ones

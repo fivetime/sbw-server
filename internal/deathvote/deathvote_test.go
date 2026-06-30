@@ -145,7 +145,7 @@ func TestVoteExpiresOnCrash(t *testing.T) {
 		t.Fatal("vote should be present after Down")
 	}
 
-	dyingCli.Close() // crash: keep-alive stops, lease no longer renewed
+	_ = dyingCli.Close() // crash: keep-alive stops, lease no longer renewed
 	deadline := time.Now().Add(8 * time.Second)
 	for time.Now().Before(deadline) {
 		if !votePresent(t, cli, p, "edge-5", "ctrl-dying") {

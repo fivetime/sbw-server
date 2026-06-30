@@ -92,6 +92,7 @@ func New(kv clientv3.KV, prefix string, ttl time.Duration, opts ...Option) *Ledg
 // tokPrefix is the prefix under which all of agent's shard counters live:
 // "<prefix>tok/<agent>/". The shard keys are tokPrefix + shardIndex.
 func (l *Ledger) tokPrefix(agent string) string { return l.prefix + "tok/" + agent + "/" }
+
 func (l *Ledger) tokShard(agent string, s int) string {
 	return l.tokPrefix(agent) + strconv.Itoa(s)
 }

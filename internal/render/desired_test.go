@@ -347,6 +347,7 @@ func keys(m map[model.EdgeID]model.EdgeDesiredState) []model.EdgeID {
 	}
 	return out
 }
+
 func anchorPrefixes(s model.EdgeDesiredState) []netip.Prefix {
 	var out []netip.Prefix
 	for _, a := range s.Anchors {
@@ -354,6 +355,7 @@ func anchorPrefixes(s model.EdgeDesiredState) []netip.Prefix {
 	}
 	return out
 }
+
 func flowPrefixes(s model.EdgeDesiredState) []netip.Prefix {
 	var out []netip.Prefix
 	for _, f := range s.FlowRedirects {
@@ -361,6 +363,7 @@ func flowPrefixes(s model.EdgeDesiredState) []netip.Prefix {
 	}
 	return out
 }
+
 func prefixSet(ps []netip.Prefix) map[netip.Prefix]bool {
 	m := map[netip.Prefix]bool{}
 	for _, p := range ps {

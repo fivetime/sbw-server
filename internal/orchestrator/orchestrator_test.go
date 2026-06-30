@@ -12,11 +12,12 @@ import (
 	"time"
 
 	"github.com/fivetime/sbw-contract/model"
+	clientv3 "go.etcd.io/etcd/client/v3"
+
 	"github.com/fivetime/sbw-server/internal/edgever"
 	"github.com/fivetime/sbw-server/internal/ledger"
 	"github.com/fivetime/sbw-server/internal/poolstore"
 	"github.com/fivetime/sbw-server/internal/registry"
-	clientv3 "go.etcd.io/etcd/client/v3"
 )
 
 // Local etcd for this package (distinct port so `go test ./...` parallelizes).
@@ -813,6 +814,7 @@ func (d *deltaCapture) PushDelta(_ model.EdgeID, delta model.EdgeDesiredDelta) e
 	d.mu.Unlock()
 	return nil
 }
+
 func (d *deltaCapture) last() model.EdgeDesiredDelta {
 	d.mu.Lock()
 	defer d.mu.Unlock()

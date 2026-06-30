@@ -9,6 +9,7 @@ import (
 
 	"github.com/fivetime/sbw-contract/model"
 	"github.com/fivetime/sbw-contract/rpc"
+
 	"github.com/fivetime/sbw-server/internal/orchestrator"
 	"github.com/fivetime/sbw-server/internal/shard"
 )

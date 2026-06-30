@@ -2,7 +2,6 @@ package server
 
 import (
 	"context"
-	"fmt"
 	"sync"
 	"time"
 
@@ -141,28 +140,6 @@ func (cp *ControlPlane) RefreshMetrics(ctx context.Context) {
 // cancelled. Blocks; run in a goroutine.
 func (cp *ControlPlane) RunMetricsRefresh(ctx context.Context, interval time.Duration) {
 	cp.runLoop(ctx, interval, func(ctx context.Context) { cp.RefreshMetrics(ctx) })
-}
-
-// waitGenerationApplied blocks until edge's latest cached report shows it
-// applied generation >= want, or the timeout/ctx elapses (§4.4①/§5.9② ready
-// gate). It polls the report cache, which the gRPC Report path keeps fresh.
-func waitGenerationApplied(ctx context.Context, cache *reportCache, edge model.EdgeID, want uint64, timeout time.Duration) error {
-	deadline := time.Now().Add(timeout)
-	t := time.NewTicker(100 * time.Millisecond)
-	defer t.Stop()
-	for {
-		if r, ok := cache.get(edge); ok && r.Health.GenerationApplied >= want {
-			return nil
-		}
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-t.C:
-			if time.Now().After(deadline) {
-				return fmt.Errorf("edge %s did not apply generation %d within %s", edge, want, timeout)
-			}
-		}
-	}
 }
 
 func abs64(x int64) int64 {

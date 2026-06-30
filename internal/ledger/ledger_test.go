@@ -77,6 +77,7 @@ func (c *clock) now() time.Time {
 	defer c.mu.Unlock()
 	return c.t
 }
+
 func (c *clock) advance(d time.Duration) {
 	c.mu.Lock()
 	c.t = c.t.Add(d)
