@@ -99,3 +99,72 @@ func TestAssignmentForNoCoverers(t *testing.T) {
 		t.Fatalf("no coverers connected: want not-ok, got %+v", a)
 	}
 }
+
+// delStream removes a coverer stream (simulating a coverer death/evict). Test-only.
+func delStream(f *desiredFan, id string) {
+	f.mu.Lock()
+	delete(f.streams, id)
+	f.mu.Unlock()
+}
+
+// drainRehome non-blockingly pops one Assignment and reports whether it is a REHOME.
+func drainRehome(s *covererStream) bool {
+	select {
+	case a := <-s.ch:
+		return a.Kind == rpc.Assignment_EDGE_DIRECTIVE && a.Directive != nil && a.Directive.Kind == rpc.Directive_REHOME
+	default:
+		return false
+	}
+}
+
+// TestRehomeOnPrimaryFlip proves the coverage-recompute REHOME path: a steady recompute
+// pushes nothing, a primary's DEATH rehomes the edge onto the survivor, and the primary's
+// RECOVERY rehomes the edge BACK (broadcast to all covers so the agent — sitting on its
+// fallback — is told to migrate to the recovered primary). An unregistered edge is never
+// rehomed on first observation.
+func TestRehomeOnPrimaryFlip(t *testing.T) {
+	f := newDesiredFan(slog.New(slog.DiscardHandler), 2)
+	addStream(f, "10.99.0.10", "coverer-0.sbw-system:1791")
+	addStream(f, "10.99.0.11", "coverer-1.sbw-system:1791")
+	edge := model.EdgeID("l1")
+
+	a, ok := f.assignmentFor(edge)
+	if !ok {
+		t.Fatal("assignmentFor not ok with both coverers")
+	}
+	primary0 := a.Coverers[0].ControllerID
+	other := "10.99.0.11"
+	if primary0 == "10.99.0.11" {
+		other = "10.99.0.10"
+	}
+	f.notePrimary(edge, primary0) // agent registered + homed to its primary
+
+	// Steady recompute: no flip -> no REHOME.
+	if n := f.rehomeChangedPrimaries([]model.EdgeID{edge}); n != 0 {
+		t.Fatalf("steady recompute should rehome nothing, got %d", n)
+	}
+
+	// Primary DEATH: edge's only remaining coverer is `other`; it must be rehomed there.
+	delStream(f, primary0)
+	if n := f.rehomeChangedPrimaries([]model.EdgeID{edge}); n != 1 {
+		t.Fatalf("primary death should rehome 1, got %d", n)
+	}
+	if !drainRehome(f.streams[other]) {
+		t.Fatalf("survivor %s got no REHOME after primary death", other)
+	}
+
+	// Primary RECOVERY: flips back -> REHOME broadcast reaches the recovered primary (where
+	// the agent must migrate from its fallback).
+	addStream(f, primary0, "recovered.sbw-system:1791")
+	if n := f.rehomeChangedPrimaries([]model.EdgeID{edge}); n != 1 {
+		t.Fatalf("primary recovery should rehome 1, got %d", n)
+	}
+	if !drainRehome(f.streams[primary0]) {
+		t.Fatalf("recovered primary %s got no REHOME (agent on fallback would be black-holed)", primary0)
+	}
+
+	// First observation of an UNREGISTERED edge (no notePrimary): record baseline, no REHOME.
+	if n := f.rehomeChangedPrimaries([]model.EdgeID{model.EdgeID("neveredge")}); n != 0 {
+		t.Fatalf("unregistered edge first recompute should rehome nothing, got %d", n)
+	}
+}

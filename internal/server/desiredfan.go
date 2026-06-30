@@ -55,6 +55,13 @@ type covererStream struct {
 type desiredFan struct {
 	mu      sync.Mutex
 	streams map[string]*covererStream
+	// lastPrimary[edge] is the coverer id the edge's agent was last told to home to
+	// (primary = covers[0]) — seeded at Register (notePrimary) and updated whenever a
+	// coverage recompute REHOMEs it. rehomeChangedPrimaries pushes a REHOME only when an
+	// edge's recomputed primary DIFFERS from this, so a steady recompute (no HRW flip)
+	// emits nothing and a coverer recovery migrates only the edges that actually moved.
+	// Guarded by mu.
+	lastPrimary map[string]string
 	// k is the HRW replication factor over the CONNECTED coverer set: an edge routes
 	// to the top-k of the connected coverers, primary-first. Wired at construction
 	// from CPOptions.CoverageK (== the server's sharding K).
@@ -82,7 +89,17 @@ var (
 // stream is created fresh on its Watch connect (connectCoverer). k is the HRW
 // replication factor over the connected coverer set.
 func newDesiredFan(log *slog.Logger, k int) *desiredFan {
-	return &desiredFan{streams: map[string]*covererStream{}, k: k, log: log}
+	return &desiredFan{streams: map[string]*covererStream{}, lastPrimary: map[string]string{}, k: k, log: log}
+}
+
+// notePrimary records the coverer an edge's agent was just told to home to (the Register
+// reply's primary), seeding the rehome baseline so the FIRST coverage recompute after a
+// registration can detect a primary that has since moved (an agent that registered during
+// partial connectivity and homed to a coverer that is no longer its HRW primary).
+func (f *desiredFan) notePrimary(edge model.EdgeID, primary string) {
+	f.mu.Lock()
+	f.lastPrimary[string(edge)] = primary
+	f.mu.Unlock()
 }
 
 // connectedCovererIDsLocked is the SINGLE read point of the connected-coverer
@@ -124,6 +141,72 @@ func (f *desiredFan) PushRehome(edge model.EdgeID, a model.CovererAssignment) er
 		return err
 	}
 	return f.emit(edge, &rpc.Directive{Kind: rpc.Directive_REHOME, Payload: p})
+}
+
+// PushRehomeAll marshals a coverer assignment into a REHOME directive and emits it to EVERY
+// connected covering coverer of edge — NOT just the primary covers[0] that emit targets.
+// A REHOME must reach the agent WHEREVER it homed: after a coverage change the agent may sit
+// on a fallback coverer, not the new primary, so a single-target emit to the new primary
+// would miss it. Each covering coverer relays to its own subscribed agents; the one the
+// agent is actually on delivers, the others drop (no subscription) — harmless and idempotent.
+func (f *desiredFan) PushRehomeAll(edge model.EdgeID, a model.CovererAssignment) error {
+	p, err := json.Marshal(a)
+	if err != nil {
+		return err
+	}
+	f.emitToAllCovers(edge, &rpc.Directive{Kind: rpc.Directive_REHOME, Payload: p})
+	return nil
+}
+
+// emitToAllCovers pushes d to the Watch channel of EVERY connected covering coverer of edge
+// (the top-k HRW set), not just the primary. Used for REHOME (see PushRehomeAll). Same
+// blocks-never-drops channel discipline as emit, per coverer, with the per-stream done as
+// the release valve; the streams snapshot is taken under mu, the sends run after unlock.
+func (f *desiredFan) emitToAllCovers(edge model.EdgeID, d *rpc.Directive) {
+	f.mu.Lock()
+	ids := shard.Coverers(string(edge), f.connectedCovererIDsLocked(), f.k)
+	streams := make([]*covererStream, 0, len(ids))
+	for _, id := range ids {
+		if s := f.streams[id]; s != nil {
+			streams = append(streams, s)
+		}
+	}
+	f.mu.Unlock()
+	for _, s := range streams {
+		a := &rpc.Assignment{Kind: rpc.Assignment_EDGE_DIRECTIVE, EdgeId: string(edge), Directive: d}
+		select {
+		case s.ch <- a:
+		case <-s.done:
+		}
+	}
+}
+
+// rehomeChangedPrimaries pushes a REHOME to every edge whose PRIMARY coverer changed since
+// the last observation — the missing half of coverage recompute: recomputeCoverageAll
+// re-emits COVERAGE (tap targets) to coverers but never tells agents to migrate, so without
+// this a coverer recovery leaves an agent on its fallback while desired-state routes to the
+// recovered (higher-HRW) primary — a latent black-hole. It REHOMEs only edges whose primary
+// actually moved (lastPrimary, seeded at Register) so a steady recompute and the first
+// observation of an unregistered edge push nothing. Returns the count rehomed.
+func (f *desiredFan) rehomeChangedPrimaries(edges []model.EdgeID) int {
+	n := 0
+	for _, edge := range edges {
+		a, ok := f.assignmentFor(edge)
+		if !ok {
+			continue
+		}
+		primary := a.Coverers[0].ControllerID
+		f.mu.Lock()
+		prev, seen := f.lastPrimary[string(edge)]
+		f.lastPrimary[string(edge)] = primary
+		f.mu.Unlock()
+		if seen && prev != primary {
+			if err := f.PushRehomeAll(edge, a); err == nil {
+				n++
+			}
+		}
+	}
+	return n
 }
 
 // streamForLocked returns the connected coverer stream serving edge: it resolves the

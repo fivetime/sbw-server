@@ -101,6 +101,12 @@ func (p *scvrProvider) Register(ctx context.Context, req *rpc.RegisterRequest) (
 			if b, mErr := json.Marshal(a); mErr == nil {
 				resp.Coverers = b
 			}
+			// Seed the rehome baseline with the primary the agent is being told to home to,
+			// so the next coverage recompute can detect a primary that moves out from under
+			// it (coverer recovery / late join) and REHOME the agent (rehomeChangedPrimaries).
+			if len(a.Coverers) > 0 {
+				p.cp.fan.notePrimary(edge, a.Coverers[0].ControllerID)
+			}
 		}
 	}
 	return resp, nil

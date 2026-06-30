@@ -704,6 +704,12 @@ func (cp *ControlPlane) recomputeCoverageAll(ctx context.Context) {
 		}
 		cp.fan.emitCoverage(cid, edges)
 	}
+	// COVERAGE drives the coverers' taps; this drives the AGENTS: REHOME each edge whose
+	// primary coverer moved (a coverer recovery/join is the case COVERAGE alone leaves the
+	// agent stranded on its fallback while desired-state routes to the recovered primary).
+	if n := cp.fan.rehomeChangedPrimaries(es); n > 0 {
+		cp.log.Info("coverage recompute: rehomed edges whose primary coverer changed", "count", n)
+	}
 }
 
 // RunCoverageRecompute is the debounced COVERAGE recompute loop: it waits for a
