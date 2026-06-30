@@ -61,6 +61,18 @@ func (p *scvrProvider) Report(ctx context.Context, r *rpc.CovererReport) error {
 		// SUPERSEDED: registration rides the request-response Register below (it returns a
 		// reply — accepted + coverers — that the one-way Report cannot carry). Kept only so
 		// a stray AGENT_REGISTER report is a harmless no-op.
+	case rpc.CovererReport_AGENT_SUBSCRIBE:
+		// An agent (re)opened its Subscribe stream on the coverer: push it a FULL desired-
+		// state snapshot (the cross-process onSubscribe→RerenderEdge). This closes the
+		// onSubscribe-ordering gap — a push that raced ahead of the agent's subscribe was
+		// dropped at the coverer, leaving the agent stuck awaiting a resync. Async (background
+		// ctx) so the Report stream is never blocked on the render+push (a store read).
+		edge := model.EdgeID(r.EdgeId)
+		go func() {
+			if err := p.cp.Orch.RerenderEdge(context.Background(), edge); err != nil {
+				p.cp.log.Warn("agent-subscribe rerender failed", "edge", edge, "err", err)
+			}
+		}()
 	}
 	return nil
 }
