@@ -29,8 +29,6 @@ import (
 	"google.golang.org/grpc"
 
 	"github.com/fivetime/sbw-server/internal/apiresult"
-	"github.com/fivetime/sbw-server/internal/coverage"
-	"github.com/fivetime/sbw-server/internal/ctrlreg"
 	"github.com/fivetime/sbw-server/internal/deathvote"
 	"github.com/fivetime/sbw-server/internal/edgever"
 	"github.com/fivetime/sbw-server/internal/server"
@@ -159,21 +157,11 @@ func main() {
 		}
 	}()
 
-	// COVERER ASSIGNMENT (Register RPC, step11/out-of-scope): the ctrlreg-backed
-	// reconciler still answers the agent's coverer-assignment reply (SetCoverer). The
-	// desired-state ROUTING + COVERAGE path no longer touches ctrlreg — it derives
-	// membership from the CONNECTED Watch streams and computes coverage by HRW (see
-	// CoverageK above). The server never joins ctrlreg nor taps (a no-op TapSink).
-	coverers := ctrlreg.New(cli, cfg.Etcd.Prefix, time.Duration(sh.LeaseTTL))
-	rec := coverage.New(selfID, sh.K, coverers, cp.Registry, noopTapSink{})
-	assigner := coverage.NewAssigner(rec, coverers)
-	cp.SetCoverer(func(ctx context.Context, edge model.EdgeID) (model.CovererAssignment, bool, error) {
-		a, err := assigner.Assign(ctx, edge)
-		if err != nil {
-			return model.CovererAssignment{}, false, err
-		}
-		return a, true, nil
-	})
+	// COVERER ASSIGNMENT is wired in the ControlPlane constructor (covererFunc =
+	// fan.assignmentFor): the agent's coverer set is the SAME connected-coverer HRW the
+	// desired-state routing uses, so the agent homes to the exact coverer the server routes
+	// its EDGE_DIRECTIVE through — no store, no ctrlreg join, no tap. The step-11
+	// ctrlreg/etcd-backed assigner placeholder is gone (membership = connected Watch streams).
 
 	// Prometheus /metrics.
 	if cfg.MetricsListenAddr != "" {
@@ -248,13 +236,6 @@ func main() {
 	}
 	cp.Stop() // evict coverer streams + bounded graceful stop of gs
 }
-
-// noopTapSink satisfies coverage.TapSink for the server, which never taps edges (the
-// RIB tap is the coverer's). Only CoverersOf / Assign are used off the Reconciler;
-// Ensure is a no-op so Reconcile (never called here) would be harmless.
-type noopTapSink struct{}
-
-func (noopTapSink) Ensure(context.Context, []model.EdgeID) error { return nil }
 
 // homeMarkerFn builds the per-edge home-marker large community from config (§4.7 /
 // T-703 / C-04 backstop): a home edge's anchors carry `GlobalAdmin:LocalData1:<edge>`

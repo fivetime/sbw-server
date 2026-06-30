@@ -31,9 +31,13 @@ var ErrNotSubscribed = errors.New("coverer not subscribed")
 // the ServerCoverer gRPC contract). ch carries the Assignments the server fans to
 // this coverer; done is closed to supersede/evict it.
 type covererStream struct {
-	id   string
-	ch   chan *rpc.Assignment
-	done chan struct{}
+	id string
+	// endpoint is the coverer's externally-routable agent-facing address
+	// (WatchRequest.agent_endpoint), handed back to agents in their coverer-assignment so
+	// they home to their PRIMARY coverer. May be "" (coverer advertised none — K=1 ok).
+	endpoint string
+	ch       chan *rpc.Assignment
+	done     chan struct{}
 }
 
 // desiredFan is the SERVER-HALF of the ServerCoverer Watch downlink. It satisfies
@@ -142,6 +146,38 @@ func (f *desiredFan) streamForIDs(ids []string) *covererStream {
 		}
 	}
 	return nil
+}
+
+// assignmentFor computes the agent's coverer-assignment over the SAME connected-coverer
+// HRW the desired-state routing uses (streamForLocked) — so the coverer the agent is told
+// to home to is exactly the one the server actually routes EDGE_DIRECTIVE through. It maps
+// the top-k covering coverer ids to model.Coverer{id, agent-endpoint, primary}, primary =
+// covers[0]. Returns false when no coverer is connected (registration must not fail on it;
+// the agent stays put and is re-homed by the next REHOME). Every id in covers is from the
+// connected set read under the same lock, so each has a live stream.
+func (f *desiredFan) assignmentFor(edge model.EdgeID) (model.CovererAssignment, bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	covers := shard.Coverers(string(edge), f.connectedCovererIDsLocked(), f.k)
+	if len(covers) == 0 {
+		return model.CovererAssignment{}, false
+	}
+	out := model.CovererAssignment{EdgeID: edge, Coverers: make([]model.Coverer, 0, len(covers))}
+	for i, id := range covers {
+		s := f.streams[id]
+		if s == nil {
+			continue // belt-and-braces; covers ⊆ connected set under this lock
+		}
+		out.Coverers = append(out.Coverers, model.Coverer{
+			ControllerID: id,
+			GRPCEndpoint: s.endpoint,
+			Primary:      i == 0,
+		})
+	}
+	if len(out.Coverers) == 0 {
+		return model.CovererAssignment{}, false
+	}
+	return out, true
 }
 
 // IsSubscribed reports whether a covering coverer's Watch stream is connected here.

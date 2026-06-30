@@ -47,7 +47,7 @@ func (s *covererServer) Watch(req *rpc.WatchRequest, stream rpc.ServerCoverer_Wa
 		return errors.New("watch: empty coverer_id")
 	}
 	cp := s.cp
-	cs := cp.connectCoverer(covererID)
+	cs := cp.connectCoverer(covererID, req.AgentEndpoint)
 	ctx := stream.Context()
 	// Cleanup on disconnect: unregister this stream (if still current) so a stale
 	// entry never wedges emit.
@@ -124,13 +124,13 @@ func (s *covererServer) Register(ctx context.Context, req *rpc.RegisterRequest) 
 // transport's Subscribe reconnect). Cross-process the server tolerates "orchestrator
 // emits for a not-yet-connected coverer" (emit drops with ErrNotSubscribed per the
 // connectivity gate); initialCovererSync on every (re)connect is the recovery.
-func (cp *ControlPlane) connectCoverer(covererID string) *covererStream {
+func (cp *ControlPlane) connectCoverer(covererID, endpoint string) *covererStream {
 	f := cp.fan
 	f.mu.Lock()
 	if old := f.streams[covererID]; old != nil {
 		close(old.done) // supersede the prior stream
 	}
-	s := &covererStream{id: covererID, ch: make(chan *rpc.Assignment, seamBuffer), done: make(chan struct{})}
+	s := &covererStream{id: covererID, endpoint: endpoint, ch: make(chan *rpc.Assignment, seamBuffer), done: make(chan struct{})}
 	f.streams[covererID] = s
 	f.mu.Unlock()
 	// A new coverer SHRINKS every other coverer's covered set (HRW reshuffle), so all

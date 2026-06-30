@@ -624,7 +624,16 @@ func NewControlPlane(kv clientv3.KV, opt CPOptions) *ControlPlane {
 
 	cp.Orch = orch
 	cp.Liveness = mon
-	cp.fan = fan                    // server-half desired-state fan (the ServerCoverer WATCH downlink)
+	cp.fan = fan // server-half desired-state fan (the ServerCoverer WATCH downlink)
+	// COVERER ASSIGNMENT default: the agent's coverer set is derived from the SAME
+	// connected-coverer HRW the desired-state routing uses (fan.assignmentFor) — so an agent
+	// is told to home to the EXACT coverer the server routes its EDGE_DIRECTIVE through, with
+	// that coverer's advertised agent-endpoint. No store: the connected Watch streams are the
+	// source of truth. (Replaces the step-11 ctrlreg/etcd-backed assigner placeholder.)
+	cp.covererFunc = func(_ context.Context, edge model.EdgeID) (model.CovererAssignment, bool, error) {
+		a, ok := fan.assignmentFor(edge)
+		return a, ok, nil
+	}
 	cp.scvr = &scvrProvider{cp: cp} // the server-half of the ServerCoverer Report/Register
 	cp.onReport = onReport          // the server-half report processing the gRPC Report dispatches to
 	cp.onRegister = onRegister      // the server-half register processing the gRPC Register dispatches to
