@@ -1,0 +1,55 @@
+# CI: lint, vet, race tests, build, ARM64 artifacts.
+# Logic lives in scripts/ci.sh — keep this file a thin runner so local
+# `bash scripts/ci.sh` and CI stay identical.
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  ci:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      # go.mod has one path replace — `github.com/fivetime/sbw-contract => ../sbw-contract`
+      # — a sibling-checkout convenience for local dev. CI checks out only this repo, so
+      # vet/lint/test/build can't resolve the replace until the sibling exists. Clone it
+      # next to the workspace (same repo/ref as docker/Dockerfile). Private repo → needs
+      # GH_PAT with read access; github.token is scoped to this repo only.
+      - name: Checkout local-replace target (sbw-contract)
+        run: |
+          git clone --depth 1 -b main \
+            "https://x-access-token:${GH_TOKEN}@github.com/fivetime/sbw-contract.git" \
+            ../sbw-contract
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT || github.token }}
+
+      - name: Install golangci-lint (pinned)
+        uses: golangci/golangci-lint-action@v9.2.1
+        with:
+          version: v2.12.2
+          install-mode: binary
+          install-only: true
+
+      - name: Run CI pipeline
+        run: bash scripts/ci.sh
+        env:
+          CI: "true"
+
+      - name: Upload ARM64 artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: sbw-server-arm64
+          path: dist/*-linux-arm64
+          retention-days: 14
