@@ -16,6 +16,7 @@ import (
 	"github.com/fivetime/sbw-server/internal/liveness"
 	"github.com/fivetime/sbw-server/internal/orchestrator"
 	"github.com/fivetime/sbw-server/internal/registry"
+	"github.com/fivetime/sbw-server/internal/shard"
 	clientv3 "go.etcd.io/etcd/client/v3"
 	"google.golang.org/grpc"
 )
@@ -76,10 +77,14 @@ type ControlPlane struct {
 	// fan's streams; this is the server replica's own identity for the etcd death-vote
 	// bridge and the liveness monitor.
 	replicaID string
-	// coveredEdgesForFn resolves a coverer id to the edges it covers (coverage CoveredSet
-	// over the COVERER membership + the agent registry). Wired via SetCoveredEdgesFor;
-	// used by initialCovererSync on each (re)connect. nil ⇒ no edges (single-server).
-	coveredEdgesForFn func(context.Context, string) ([]model.EdgeID, error)
+	// coverageK is the HRW replication factor K applied over the CONNECTED coverer set
+	// for BOTH edge→coverer routing (desiredFan.k) and COVERAGE (CoveredEdges). Sourced
+	// from the one sh.K so routing and tap-assignment stay consistent.
+	coverageK int
+	// coverageRecalc coalesces COVERAGE recompute triggers (connect / evict / first
+	// register). Buffered cap 1: a burst collapses to a single pending recompute that
+	// RunCoverageRecompute debounces. Scheduled non-blocking via scheduleCoverageRecompute.
+	coverageRecalc chan struct{}
 
 	reports       *reportCache
 	acctTolerance uint64
@@ -276,6 +281,10 @@ type CPOptions struct {
 	// CreateWindow is the ±skew the create anti-replay timestamp must fall within
 	// (and the nonce key's TTL lease). 0 → default 5min.
 	CreateWindow time.Duration
+	// CoverageK is the HRW replication factor K over the CONNECTED coverer set, applied
+	// to BOTH desired-state routing and COVERAGE (tap-assignment). 0 → 1. In production
+	// main.go passes the resolved sh.K so routing and coverage agree.
+	CoverageK int
 	// Logger; defaults to slog.Default().
 	Logger *slog.Logger
 }
@@ -320,6 +329,9 @@ func NewControlPlane(kv clientv3.KV, opt CPOptions) *ControlPlane {
 	if opt.CreateWindow == 0 {
 		opt.CreateWindow = defaultCreateWindow
 	}
+	if opt.CoverageK == 0 {
+		opt.CoverageK = 1
+	}
 
 	reg := registry.New(kv, opt.Prefix)
 	led := ledger.New(kv, opt.Prefix, opt.ReservationTTL)
@@ -331,12 +343,14 @@ func NewControlPlane(kv clientv3.KV, opt CPOptions) *ControlPlane {
 	// is constructed; cp is returned at the end.
 	cp := &ControlPlane{
 		Registry: reg, Ledger: led,
-		replicaID:     opt.SelfID,
-		reports:       reports,
-		acctTolerance: opt.AccountToleranceBps,
-		onAcctDrift:   opt.OnAccountDrift,
-		progStreak:    make(map[model.EdgeID]int),
-		progThreshold: opt.ProgramDriftStreak,
+		replicaID:      opt.SelfID,
+		coverageK:      opt.CoverageK,
+		coverageRecalc: make(chan struct{}, 1),
+		reports:        reports,
+		acctTolerance:  opt.AccountToleranceBps,
+		onAcctDrift:    opt.OnAccountDrift,
+		progStreak:     make(map[model.EdgeID]int),
+		progThreshold:  opt.ProgramDriftStreak,
 		// onProgDrift / onAnchorMismatch are composed below (emit + user option) once cp
 		// exists, so the dangling TIER-1 seams fire the unsolicited events without main.go
 		// having to set the options. nil here; filled in after construction.
@@ -407,6 +421,10 @@ func NewControlPlane(kv clientv3.KV, opt CPOptions) *ControlPlane {
 		if gerr == nil {
 			if !hadPrior {
 				cp.emitEdgeRegistered(edge, int64(capacityBps))
+				// A brand-new edge joins the universe and must be assigned to its
+				// covering coverer's tap — recompute + re-emit COVERAGE (debounced). A
+				// re-register (same edge) does not change the universe, so no recompute.
+				cp.scheduleCoverageRecompute()
 			} else if prior.CapacityBps != capacityBps {
 				cp.emitEdgeCapacityChanged(edge, int64(capacityBps))
 			}
@@ -479,9 +497,9 @@ func NewControlPlane(kv clientv3.KV, opt CPOptions) *ControlPlane {
 	// this fan, not an agent transport. It implements Pusher+deltaPusher+subChecker, so
 	// renderAndPushGen/pushPoolDeltaGen/locallyDeliverable are UNCHANGED — they now fan
 	// into the per-coverer Watch channels, which the remote coverers drain over gRPC.
-	// Deliverability is re-gated on connected covering-coverer streams (coverersOf is
-	// injected post-construction via SetCoverersOf).
-	fan := newDesiredFan(log)
+	// Deliverability is re-gated by HRW over the CONNECTED coverer set (the fan's own
+	// stream map) — no etcd/ctrlreg on the routing path.
+	fan := newDesiredFan(log, opt.CoverageK)
 
 	orch = orchestrator.New(reg, fan,
 		orchestrator.WithReplicas(opt.Replicas),
@@ -609,19 +627,83 @@ func NewControlPlane(kv clientv3.KV, opt CPOptions) *ControlPlane {
 	return cp
 }
 
-// SetCoverersOf wires the edge→covering-coverer-ids resolver the desiredFan uses to
-// re-gate deliverability (coverage.Reconciler.CoverersOf over the COVERER membership).
-// Call once at startup before serving coverers; until it is set, nothing is locally
-// deliverable (every emit returns ErrNotSubscribed).
-func (cp *ControlPlane) SetCoverersOf(fn func(context.Context, model.EdgeID) ([]string, error)) {
-	cp.fan.coverersOf = fn
+// connectedCovererIDs is the connected-coverer membership (sorted keys of the fan's
+// stream map) — the single source of truth that REPLACES ctrlreg for coverage. Cheap,
+// no etcd. Used off the hot path (coverage compute / recompute) only.
+func (cp *ControlPlane) connectedCovererIDs() []string {
+	cp.fan.mu.Lock()
+	defer cp.fan.mu.Unlock()
+	return cp.fan.connectedCovererIDsLocked()
 }
 
-// SetCoveredEdgesFor wires the coverer-id→covered-edges resolver initialCovererSync
-// uses on each (re)connect (coverage CoveredSet over the COVERER membership + the
-// agent registry). Call once at startup. nil leaves initial sync empty.
-func (cp *ControlPlane) SetCoveredEdgesFor(fn func(context.Context, string) ([]model.EdgeID, error)) {
-	cp.coveredEdgesForFn = fn
+// scheduleCoverageRecompute coalesces a COVERAGE recompute request into the cap-1
+// channel without blocking: a burst (fleet reconnect) collapses to one pending signal
+// that RunCoverageRecompute debounces.
+func (cp *ControlPlane) scheduleCoverageRecompute() {
+	select {
+	case cp.coverageRecalc <- struct{}{}:
+	default:
+	}
+}
+
+// recomputeCoverageAll re-derives each connected coverer's COVERAGE by HRW over the
+// connected set + the REGISTRY edge universe and re-emits it. A connect SHRINKS / an
+// evict GROWS every other coverer's covered set, so all must be refreshed. Best-effort:
+// an absent/superseded stream is skipped by emitCoverage; an edge-universe read error
+// just skips this pass (the next trigger / DriftSweep backstops).
+func (cp *ControlPlane) recomputeCoverageAll(ctx context.Context) {
+	ids := cp.connectedCovererIDs()
+	if len(ids) == 0 {
+		return
+	}
+	es, err := cp.Registry.EdgeIDs(ctx)
+	if err != nil {
+		cp.log.Warn("coverage recompute: edge universe read failed", "err", err)
+		return
+	}
+	strs := make([]string, len(es))
+	for i, e := range es {
+		strs[i] = string(e)
+	}
+	for _, cid := range ids {
+		covered := shard.CoveredEdges(cid, strs, ids, cp.coverageK)
+		edges := make([]model.EdgeID, len(covered))
+		for i, s := range covered {
+			edges[i] = model.EdgeID(s)
+		}
+		cp.fan.emitCoverage(cid, edges)
+	}
+}
+
+// RunCoverageRecompute is the debounced COVERAGE recompute loop: it waits for a
+// scheduled trigger, then coalesces a burst by resetting a debounce timer until the
+// membership/edge-universe is quiet for `debounce`, and re-emits COVERAGE to every
+// connected coverer. Blocks; run in a goroutine.
+func (cp *ControlPlane) RunCoverageRecompute(ctx context.Context, debounce time.Duration) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-cp.coverageRecalc:
+			t := time.NewTimer(debounce)
+		coalesce:
+			for {
+				select {
+				case <-cp.coverageRecalc:
+					if !t.Stop() {
+						<-t.C
+					}
+					t.Reset(debounce)
+				case <-t.C:
+					break coalesce
+				case <-ctx.Done():
+					t.Stop()
+					return
+				}
+			}
+			cp.recomputeCoverageAll(ctx)
+		}
+	}
 }
 
 // SetGRPCServer hands the ServerCoverer gRPC server to the control plane so Stop can

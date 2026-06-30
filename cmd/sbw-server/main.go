@@ -31,7 +31,6 @@ import (
 	"github.com/fivetime/sbw-server/internal/deathvote"
 	"github.com/fivetime/sbw-server/internal/edgever"
 	"github.com/fivetime/sbw-server/internal/server"
-	"github.com/fivetime/sbw-server/internal/shard"
 	"github.com/fivetime/sbw-server/internal/ybstore"
 	clientv3 "go.etcd.io/etcd/client/v3"
 	"google.golang.org/grpc"
@@ -98,6 +97,7 @@ func main() {
 		EdgeAddrs6:           edgeAddrs6,
 		LivenessQuorum:       sh.FailoverQuorum,
 		LivenessHardDebounce: time.Duration(sh.HardDebounce),
+		CoverageK:            sh.K,
 		SelfID:               selfID,
 		HomeMarker:           homeMarkerFn(cfg.HomeMarker),
 		Metrics:              met,
@@ -158,33 +158,13 @@ func main() {
 		}
 	}()
 
-	// COVERER ROUTING: the COVERER membership (the registry the sbw-coverer processes
-	// Join) drives "who covers edge X". The server only READS it — CoverersOf re-gates
-	// the desiredFan's deliverability and Assign computes the agent's coverer set; the
-	// server never joins it nor taps (a no-op TapSink), so self/tap are irrelevant.
+	// COVERER ASSIGNMENT (Register RPC, step11/out-of-scope): the ctrlreg-backed
+	// reconciler still answers the agent's coverer-assignment reply (SetCoverer). The
+	// desired-state ROUTING + COVERAGE path no longer touches ctrlreg — it derives
+	// membership from the CONNECTED Watch streams and computes coverage by HRW (see
+	// CoverageK above). The server never joins ctrlreg nor taps (a no-op TapSink).
 	coverers := ctrlreg.New(cli, cfg.Etcd.Prefix, time.Duration(sh.LeaseTTL))
 	rec := coverage.New(selfID, sh.K, coverers, cp.Registry, noopTapSink{})
-	cp.SetCoverersOf(rec.CoverersOf)
-	cp.SetCoveredEdgesFor(func(ctx context.Context, covererID string) ([]model.EdgeID, error) {
-		ids, err := coverers.IDs(ctx)
-		if err != nil {
-			return nil, err
-		}
-		es, err := cp.Registry.EdgeIDs(ctx)
-		if err != nil {
-			return nil, err
-		}
-		strs := make([]string, len(es))
-		for i, e := range es {
-			strs[i] = string(e)
-		}
-		covered := shard.CoveredEdges(covererID, strs, ids, sh.K)
-		out := make([]model.EdgeID, len(covered))
-		for i, s := range covered {
-			out[i] = model.EdgeID(s)
-		}
-		return out, nil
-	})
 	assigner := coverage.NewAssigner(rec, coverers)
 	cp.SetCoverer(func(ctx context.Context, edge model.EdgeID) (model.CovererAssignment, bool, error) {
 		a, err := assigner.Assign(ctx, edge)
@@ -237,6 +217,9 @@ func main() {
 		}
 	}()
 	go cp.RunPoolReconcile(ctx, 5*time.Second)
+	// COVERAGE recompute loop: re-emit each connected coverer's HRW covered-edge set
+	// on connect/evict/first-register (debounced ~250ms to coalesce a fleet reconnect).
+	go cp.RunCoverageRecompute(ctx, 250*time.Millisecond)
 
 	// Serve the rpc.ServerCoverer gRPC contract — ONLY this service (NOT AgentService:
 	// agents dial the coverer, not the server).

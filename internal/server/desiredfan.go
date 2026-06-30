@@ -1,15 +1,16 @@
 package server
 
 import (
-	"context"
 	"encoding/json"
 	"errors"
 	"log/slog"
+	"sort"
 	"sync"
 
 	"github.com/fivetime/sbw-contract/model"
 	"github.com/fivetime/sbw-contract/rpc"
 	"github.com/fivetime/sbw-server/internal/orchestrator"
+	"github.com/fivetime/sbw-server/internal/shard"
 )
 
 // seamBuffer is the per-coverer Watch channel depth. The seam NEVER drops (the
@@ -43,17 +44,17 @@ type covererStream struct {
 //
 // Re-gating (the load-bearing split fix): the server can no longer ask an agent
 // transport "is this agent here?". Deliverability is re-gated on whether a coverer
-// Watch stream covering the edge is connected HERE: streamFor(edge) resolves the
-// covering coverer ids via coverersOf (coverage.Reconciler.CoverersOf) and returns
-// the first one with a live entry in streams.
+// Watch stream covering the edge is connected HERE: streamForLocked(edge) computes
+// the edge's covering coverer ids by HRW over the CONNECTED coverer set (the keys of
+// streams) and returns the first one with a live entry — no store I/O at all.
 type desiredFan struct {
 	mu      sync.Mutex
 	streams map[string]*covererStream
-	// coverersOf resolves an edge to the controller/coverer ids covering it,
-	// primary-first (wired post-construction to coverage.Reconciler.CoverersOf via
-	// cp.SetCoverersOf). nil until wired → nothing is locally deliverable.
-	coverersOf func(context.Context, model.EdgeID) ([]string, error)
-	log        *slog.Logger
+	// k is the HRW replication factor over the CONNECTED coverer set: an edge routes
+	// to the top-k of the connected coverers, primary-first. Wired at construction
+	// from CPOptions.CoverageK (== the server's sharding K).
+	k   int
+	log *slog.Logger
 }
 
 // Compile-time proof the fan satisfies the orchestrator's Pusher and the optional
@@ -73,10 +74,22 @@ var (
 )
 
 // newDesiredFan builds the server-half fan. It pre-registers NO stream: a coverer's
-// stream is created fresh on its Watch connect (connectCoverer). coverersOf is
-// injected later via SetCoverersOf.
-func newDesiredFan(log *slog.Logger) *desiredFan {
-	return &desiredFan{streams: map[string]*covererStream{}, log: log}
+// stream is created fresh on its Watch connect (connectCoverer). k is the HRW
+// replication factor over the connected coverer set.
+func newDesiredFan(log *slog.Logger, k int) *desiredFan {
+	return &desiredFan{streams: map[string]*covererStream{}, k: k, log: log}
+}
+
+// connectedCovererIDsLocked is the SINGLE read point of the connected-coverer
+// membership: the sorted keys of f.streams. This is the source of truth that REPLACES
+// ctrlreg/etcd for routing + coverage — cheap, no I/O. Caller holds f.mu.
+func (f *desiredFan) connectedCovererIDsLocked() []string {
+	ids := make([]string, 0, len(f.streams))
+	for id := range f.streams {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	return ids
 }
 
 // PushDesired marshals the FULL edge snapshot into a DESIRED_STATE directive and
@@ -108,27 +121,15 @@ func (f *desiredFan) PushRehome(edge model.EdgeID, a model.CovererAssignment) er
 	return f.emit(edge, &rpc.Directive{Kind: rpc.Directive_REHOME, Payload: p})
 }
 
-// streamFor returns the connected coverer stream serving edge: the FIRST of the
-// edge's coverers (primary-first) that has a live Watch stream registered here.
-// nil when coverersOf is unwired or no covering coverer is connected. Caller holds
-// f.mu.
-// coversIDs resolves the coverer ids covering edge (primary-first). The wired coverersOf
-// hits ctrlreg/etcd, so this MUST be called WITHOUT holding f.mu — holding the global fan
-// lock across a store round-trip would serialize every emit behind etcd and stall on a slow
-// store. (TODO step10/11: route over the CONNECTED coverer set f.streams via HRW so the hot
-// path needs no store I/O at all, and keep COVERAGE computed from the same set.)
-func (f *desiredFan) coversIDs(edge model.EdgeID) []string {
-	if f.coverersOf == nil {
-		return nil
-	}
-	ids, err := f.coverersOf(context.Background(), edge)
-	if err != nil {
-		if f.log != nil {
-			f.log.Warn("desiredfan: coverersOf failed", "edge", edge, "err", err)
-		}
-		return nil
-	}
-	return ids
+// streamForLocked returns the connected coverer stream serving edge: it resolves the
+// edge's covering coverer ids by HRW over the CONNECTED coverer set, then picks the
+// first (highest-HRW) — which is necessarily connected because the candidate set IS
+// the connected set. nil when no coverer is connected. Pure CPU, no store I/O. Caller
+// holds f.mu.
+func (f *desiredFan) streamForLocked(edge model.EdgeID) *covererStream {
+	ids := f.connectedCovererIDsLocked()
+	covers := shard.Coverers(string(edge), ids, f.k) // top-k of the connected set, pure CPU
+	return f.streamForIDs(covers)                    // first with a live stream == covers[0]
 }
 
 // streamForIDs returns the first of ids that has a live Watch stream registered here, or
@@ -148,10 +149,9 @@ func (f *desiredFan) streamForIDs(ids []string) *covererStream {
 // replica is not pushed locally; it is bumped via edgever and delivered by the
 // replica whose coverer holds it, through RunConverge→RerenderEdge→fan.
 func (f *desiredFan) IsSubscribed(edge model.EdgeID) bool {
-	ids := f.coversIDs(edge) // store I/O OUTSIDE the lock
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	return f.streamForIDs(ids) != nil
+	return f.streamForLocked(edge) != nil
 }
 
 // emit routes one directive to the covering coverer's Watch channel as an
@@ -161,9 +161,8 @@ func (f *desiredFan) IsSubscribed(edge model.EdgeID) bool {
 // pump's send-deadline+evict is the only release valve. done releases the producer
 // if the stream is superseded/closed.
 func (f *desiredFan) emit(edge model.EdgeID, d *rpc.Directive) error {
-	ids := f.coversIDs(edge) // store I/O OUTSIDE the lock — never hold f.mu across etcd
 	f.mu.Lock()
-	s := f.streamForIDs(ids)
+	s := f.streamForLocked(edge) // HRW over the connected set, pure CPU under a short hold
 	f.mu.Unlock()
 	if s == nil {
 		return ErrNotSubscribed

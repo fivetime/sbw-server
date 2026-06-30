@@ -8,6 +8,7 @@ import (
 
 	"github.com/fivetime/sbw-contract/model"
 	"github.com/fivetime/sbw-contract/rpc"
+	"github.com/fivetime/sbw-server/internal/shard"
 )
 
 // covererSendDeadline bounds a single stream.Send to one coverer. If Send wedges
@@ -131,6 +132,10 @@ func (cp *ControlPlane) connectCoverer(covererID string) *covererStream {
 	s := &covererStream{id: covererID, ch: make(chan *rpc.Assignment, seamBuffer), done: make(chan struct{})}
 	f.streams[covererID] = s
 	f.mu.Unlock()
+	// A new coverer SHRINKS every other coverer's covered set (HRW reshuffle), so all
+	// must be re-emitted (debounced). The new coverer's own COVERAGE also arrives
+	// immediately via initialCovererSync (idempotent overlap is harmless).
+	cp.scheduleCoverageRecompute()
 	return s
 }
 
@@ -141,11 +146,18 @@ func (cp *ControlPlane) connectCoverer(covererID string) *covererStream {
 func (cp *ControlPlane) evictCoverer(covererID string, s *covererStream) {
 	f := cp.fan
 	f.mu.Lock()
+	removed := false
 	if cur := f.streams[covererID]; cur == s {
 		delete(f.streams, covererID)
 		close(s.done)
+		removed = true
 	}
 	f.mu.Unlock()
+	if removed {
+		// Departure GROWS the remaining coverers' covered sets — recompute + re-emit
+		// COVERAGE to all (debounced).
+		cp.scheduleCoverageRecompute()
+	}
 }
 
 // initialCovererSync is the (re)connect re-sync for a coverer: emit one COVERAGE
@@ -168,18 +180,27 @@ func (cp *ControlPlane) initialCovererSync(ctx context.Context, covererID string
 	}
 }
 
-// coveredEdgesFor returns the edges the given coverer id covers — the coverage
-// CoveredSet for that id over the live edge + coverer membership. Wired via
-// SetCoveredEdgesFor (coverage/shard over ctrlreg + the agent registry). nil func ⇒
-// no edges (single-server / unwired).
+// coveredEdgesFor returns the edges the given coverer id covers — computed by HRW
+// (shard.CoveredEdges) over the CONNECTED coverer set and the REGISTRY edge universe.
+// No ctrlreg/etcd is consulted for membership; only the edge-universe read hits etcd,
+// and that is OFF the emit/routing hot path (this runs on (re)connect only). An
+// edge-universe read error yields no edges this sync (the next sync / DriftSweep
+// backstops).
 func (cp *ControlPlane) coveredEdgesFor(ctx context.Context, covererID string) []model.EdgeID {
-	if cp.coveredEdgesForFn == nil {
-		return nil
-	}
-	edges, err := cp.coveredEdgesForFn(ctx, covererID)
+	ids := cp.connectedCovererIDs() // connected membership, no etcd
+	es, err := cp.Registry.EdgeIDs(ctx)
 	if err != nil {
-		cp.log.Warn("covered-edges lookup failed", "coverer", covererID, "err", err)
+		cp.log.Warn("covered-edges: edge universe read failed", "coverer", covererID, "err", err)
 		return nil
 	}
-	return edges
+	strs := make([]string, len(es))
+	for i, e := range es {
+		strs[i] = string(e)
+	}
+	covered := shard.CoveredEdges(covererID, strs, ids, cp.coverageK)
+	out := make([]model.EdgeID, len(covered))
+	for i, s := range covered {
+		out[i] = model.EdgeID(s)
+	}
+	return out
 }
