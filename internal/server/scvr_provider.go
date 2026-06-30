@@ -51,10 +51,12 @@ func (p *scvrProvider) Report(ctx context.Context, r *rpc.CovererReport) error {
 		}
 		return p.cp.onReport(ctx, er)
 	case rpc.CovererReport_MEMBER_EDGE:
-		// TODO(§8): feed the server's global member→edge map (placement-locality-gap →
-		// locality-aware placement; also the source the server needs to re-implement the
-		// render-time anchor suppression the coverer-side guard used to drive). No source
-		// yet (members not advertised in the lab) — stub ok.
+		// The member→edge LOCALITY + member-liveness uplink: feed the server-side presence
+		// map that re-implements the in-process halves the coverer's tap split routed up —
+		// the render-time anchor suppression (T-607), the member-up/down emits, the home
+		// re-render, and the anchor intent↔physical audit (memberedge.go onMemberEdge). It
+		// is also the server's global member→edge view (placement-locality-gap).
+		p.cp.onMemberEdge(ctx, r)
 	case rpc.CovererReport_AGENT_REGISTER:
 		// SUPERSEDED: registration rides the request-response Register below (it returns a
 		// reply — accepted + coverers — that the one-way Report cannot carry). Kept only so

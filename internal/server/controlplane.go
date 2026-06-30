@@ -103,6 +103,13 @@ type ControlPlane struct {
 	// T-607 render gate.
 	onAnchorMismatch func(AnchorMismatch)
 
+	// presence is the server-side member→edge PRESENCE/VERDICT map rebuilt from the
+	// coverer MEMBER_EDGE report stream (memberedge.go). It replaces the monolith's
+	// in-process RIB-survival guard as the source for the render-time anchor-suppression
+	// gate (WithAdvertiseGate → memberSuppressed), the member-up/down emits, and the
+	// anchor intent↔physical audit (anchoraudit.go). Always wired (newMemberPresence).
+	presence *memberPresence
+
 	// driftMu guards the per-edge report-hash state below. The report hot path
 	// (driftCheck) only takes this lock to STORE the latest reported hash — it is
 	// O(1) and never touches etcd. The periodic DriftSweep reads it to decide which
@@ -269,6 +276,12 @@ type CPOptions struct {
 	// resync — debouncing transient agent catch-up lag behind a burst of creates.
 	// 0 → default 2.
 	DriftStreakThreshold int
+	// MemberPresenceTTL is the lease window for a coverer MEMBER_EDGE present-assertion
+	// (memberedge.go). It governs the chunked-snapshot drift reap: a member no longer
+	// refreshed by the coverer's periodic snapshot lapses and is reaped after this
+	// window. MUST exceed the coverer snapshot cadence (EOR + ReconcileTapView interval)
+	// by a safety factor. 0 → default 5min.
+	MemberPresenceTTL time.Duration
 	// OnProgramDrift, if set, is called for each edge whose data-plane count drift
 	// persisted past the streak (wire to a Prometheus alert).
 	OnProgramDrift func(ProgramDrift)
@@ -368,6 +381,12 @@ func NewControlPlane(kv clientv3.KV, opt CPOptions) *ControlPlane {
 		metrics:              opt.Metrics,
 		log:                  log,
 	}
+	// The member→edge presence map: rebuilt from the coverer MEMBER_EDGE reports, it
+	// feeds the advertise gate / member-up-down emits / anchor audit below. now is the
+	// CP clock (overridable in tests); the lease TTL governs the chunked-snapshot drift
+	// reap (memberedge.go), defaulting (0) to a safe multiple of the coverer snapshot
+	// cadence.
+	cp.presence = newMemberPresence(cp.now, opt.MemberPresenceTTL)
 
 	// Wire the dangling TIER-1 observability seams (the OnProgramDrift / OnAnchorMismatch
 	// callbacks the reconcilers already fire but main.go never set): compose the
@@ -506,10 +525,12 @@ func NewControlPlane(kv clientv3.KV, opt CPOptions) *ControlPlane {
 		orchestrator.WithEdgeAddrs(opt.EdgeAddrs),
 		orchestrator.WithEdgeAddrs6(opt.EdgeAddrs6),
 		orchestrator.WithHomeMarker(opt.HomeMarker),
-		// NO WithAdvertiseGate: the RIB-survival guard is a COVERER concern (it is tap-fed)
-		// and does not live on the server. The server renders WITHOUT render-time anchor
-		// suppression — a regression vs the monolith's T-607 gate until the coverer feeds
-		// physical member presence over the seam (CovererReport.MEMBER_EDGE). Flagged risk.
+		// T-607 advertise gate, RE-LIT off the seam: the RIB-survival guard is a COVERER
+		// concern (tap-fed), but its withdraw VERDICT now arrives over CovererReport.
+		// MEMBER_EDGE and is rebuilt into cp.presence; memberSuppressed answers the render
+		// gate from that presence map exactly as the monolith's g.ShouldWithdraw did. Until
+		// a coverer feeds a view the gate fails static (advertises) — never blackholes.
+		orchestrator.WithAdvertiseGate(cp.memberSuppressed),
 		// Generation is now a PER-EDGE in-memory monotonic counter (seeded wall-clock-ms
 		// per instance): zero per-render etcd writes. The agent only needs per-edge
 		// monotonicity for its BaseGeneration gap-detection; a seed jump across a
