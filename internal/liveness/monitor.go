@@ -136,9 +136,9 @@ func (s *state) dataDead() bool {
 // debounceFor is the §4.2.4 per-fault-kind hold-down before soft-death failover.
 // Unambiguous faults fire fast — link-down immediately (a dead uplink won't heal
 // itself), vpp-gone after a short restart grace (a crashed VPP may be relaunched by
-// kubelet/supervisor and self-heal in place). Everything else (forwarding-broken,
-// loss-degraded, and FaultNone from a pre-§4.2 agent) keeps the full softDebounce,
-// so there is no regression for edges that don't type their fault.
+// kubelet/supervisor and self-heal in place). Everything else (forwarding-broken —
+// pending its device-level probe — and FaultNone from a pre-§4.2 agent) keeps the full
+// softDebounce, so there is no regression for edges that don't type their fault.
 func (m *Monitor) debounceFor(f model.FaultKind) time.Duration {
 	switch f {
 	case model.FaultLinkDown:
