@@ -7,7 +7,7 @@
 - **承重点**:coverer 只 watch server、绝不碰存储 → 存储连接数 = O(server 副本),与边数无关。
 
 ## 状态
-**Scaffold(§8 step 2)**:仅 `go.mod` + 骨架 `cmd/sbw-server`。§8 step 3 将把 server 侧包(`admin`/`scheduler`/`orchestrator`/`ybstore`/`render`/`srcmap`/`ledger`/`registry`/`apiresult`)从 `sbw-controller` 迁入,届时 `sbw-controller` 退役。共享契约/模型在 `sbw-contract`(`rpc`/`model`)。
+**已上线(§8 拆分完成)**:server 侧包(`admin`/`scheduler`/`orchestrator`/`ybstore`/`render`/`srcmap`/`ledger`/`registry`/`apiresult`)已从单体迁入,CI 全绿,并在 k3s lab 端到端验证(基本流 + onSubscribe 修复 + K=2 coverer 分配/homing + coverer failover + 恢复再平衡)。单体 `sbw-controller` 已退役(仓库归档只读)。共享契约/模型在 `sbw-contract`(`rpc`/`model`);分片传感/执行半在 `sbw-coverer`。
 
 ```bash
 go build ./...        # 编译

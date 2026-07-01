@@ -1,7 +1,7 @@
 # golangci-lint v2 config. Keep CI focused on Go code quality: correctness
 # checks, dead-code detection, bounded complexity, and mechanical formatting.
 # Avoid broad style-only linters here; they create noise without improving
-# build safety. (Kept in sync with sbw-controller/sbw-coverer.)
+# build safety. (Kept in sync with sbw-coverer.)
 version: "2"
 
 linters:
