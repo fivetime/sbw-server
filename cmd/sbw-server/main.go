@@ -27,6 +27,7 @@ import (
 	"github.com/fivetime/sbw-contract/rpc"
 	clientv3 "go.etcd.io/etcd/client/v3"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/keepalive"
 
 	"github.com/fivetime/sbw-server/internal/apiresult"
 	"github.com/fivetime/sbw-server/internal/deathvote"
@@ -212,7 +213,25 @@ func main() {
 
 	// Serve the rpc.ServerCoverer gRPC contract — ONLY this service (NOT AgentService:
 	// agents dial the coverer, not the server).
-	gs := grpc.NewServer()
+	//
+	// Keepalive is load-bearing for total-restart recovery: the coverer's Watch is a long
+	// server-stream that idles between pushes; after a mass-restart a coverer's ClientConn can
+	// end up half-open (the Watch stream created but never truly connected — the server never
+	// received it), and without keepalive the coverer blocks in stream.Recv() FOREVER (never
+	// erroring, never retrying) so it stays wedged until a manual pod restart. Server pings
+	// idle conns (KeepaliveParams) so a dead coverer is reaped; the EnforcementPolicy MUST
+	// admit the coverer's client pings (MinTime <= client ping interval, PermitWithoutStream)
+	// or the server GOAWAYs them.
+	gs := grpc.NewServer(
+		grpc.KeepaliveParams(keepalive.ServerParameters{
+			Time:    30 * time.Second,
+			Timeout: 10 * time.Second,
+		}),
+		grpc.KeepaliveEnforcementPolicy(keepalive.EnforcementPolicy{
+			MinTime:             10 * time.Second,
+			PermitWithoutStream: true,
+		}),
+	)
 	rpc.RegisterServerCovererServer(gs, server.NewCovererServer(cp))
 	cp.SetGRPCServer(gs)
 	lis, err := net.Listen("tcp", cfg.ServerCovererListenAddr)
