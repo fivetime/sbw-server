@@ -117,16 +117,18 @@ func (m *Monitor) hardDead(s *state) bool { return m.ready() && len(s.hardVotes)
 func (s *state) softDead() bool { return s.canaryDown && s.healthDead }
 
 // dataDead is the §4.2 fault-aware soft-death predicate that supersedes softDead()
-// on the failover path. For an UNAMBIGUOUS agent-typed fault (vpp-gone / link-down)
-// the agent's direct healthDead report is trustworthy on its own — no canary
-// conjunction, because a pulled uplink or a crashed VPP does not withdraw the tap
-// canary (the canary rides the kernel ctap, which survives both). For an ambiguous
-// or unclassified fault (forwarding-broken / loss / a pre-§4.2 agent reporting
-// FaultNone) it keeps the §4.7 canary∧health conjunction so one bad report alone
-// never fires. Backward-compatible: FaultNone → softDead(), the original behaviour.
+// on the failover path. For a DETERMINATE agent-typed fault (vpp-gone / link-down /
+// forwarding-broken) the agent's direct healthDead report is trustworthy on its own —
+// no canary conjunction. vpp-gone / link-down don't withdraw the tap canary (it rides
+// the kernel ctap, which survives both); forwarding-broken is AGENT-PROBE-CONFIRMED
+// (§4.2.7 — K consecutive black-holed rounds) and, crucially, a fabric-facing black-hole
+// need not sever the canary's path, so requiring the canary would blind exactly the case
+// the probe exists to catch. For an unclassified fault (a pre-§4.2 agent reporting
+// FaultNone) it keeps the §4.7 canary∧health conjunction so one bad report alone never
+// fires. Backward-compatible: FaultNone → softDead(), the original behaviour.
 func (s *state) dataDead() bool {
 	switch s.faultKind {
-	case model.FaultVPPGone, model.FaultLinkDown:
+	case model.FaultVPPGone, model.FaultLinkDown, model.FaultForwardingBroken:
 		return s.healthDead
 	default:
 		return s.softDead()
@@ -134,14 +136,15 @@ func (s *state) dataDead() bool {
 }
 
 // debounceFor is the §4.2.4 per-fault-kind hold-down before soft-death failover.
-// Unambiguous faults fire fast — link-down immediately (a dead uplink won't heal
-// itself), vpp-gone after a short restart grace (a crashed VPP may be relaunched by
-// kubelet/supervisor and self-heal in place). Everything else (forwarding-broken —
-// pending its device-level probe — and FaultNone from a pre-§4.2 agent) keeps the full
-// softDebounce, so there is no regression for edges that don't type their fault.
+// Determinate faults fire fast — link-down immediately (a dead uplink won't heal
+// itself), forwarding-broken immediately (the agent already spent §4.2.7's K probe
+// rounds confirming it — a second server debounce would just re-create the 39s the
+// whole design removes), vpp-gone after a short restart grace (a crashed VPP may be
+// relaunched by kubelet/supervisor and self-heal in place). FaultNone from a pre-§4.2
+// agent keeps the full softDebounce, so there is no regression for untyped faults.
 func (m *Monitor) debounceFor(f model.FaultKind) time.Duration {
 	switch f {
-	case model.FaultLinkDown:
+	case model.FaultLinkDown, model.FaultForwardingBroken:
 		return 0
 	case model.FaultVPPGone:
 		return m.restartGrace

@@ -631,19 +631,19 @@ func TestFaultNoneKeepsConjunctionAndSoftDebounce(t *testing.T) {
 	}
 }
 
-// A forwarding-broken fault falls through to the default branch: the full
-// conjunction + softDebounce (its own active-probe fast path is §4.2.4 future work).
-func TestFaultForwardingBrokenUsesDefault(t *testing.T) {
+// A forwarding-broken typed fault (agent probe-confirmed, §4.2.7) fires immediately on
+// the report ALONE — no canary conjunction (a fabric black-hole need not sever the
+// canary) and no extra server debounce (the agent's K probe rounds were the debounce).
+func TestFaultForwardingBrokenImmediateNoCanary(t *testing.T) {
 	r := &recorder{}
 	c := &clk{t: time.Unix(1_700_000_000, 0)}
 	m := New(time.Hour, r.onFailover, WithClock(c.now),
-		WithSoftDebounce(10*time.Second), WithRestartGrace(5*time.Second))
+		WithSoftDebounce(30*time.Second), WithRestartGrace(5*time.Second))
 	ctx := context.Background()
 	m.Heartbeat(ctx, "edge-a")
 
-	m.Health("edge-a", true, model.FaultForwardingBroken)
-	c.add(6 * time.Second) // past restart grace — must NOT fire (needs canary + softDebounce)
-	if dead := m.Tick(ctx); len(dead) != 0 {
-		t.Fatalf("forwarding-broken without canary must not fire, got %v", dead)
+	m.Health("edge-a", true, model.FaultForwardingBroken) // no canary, no wait
+	if dead := m.Tick(ctx); len(dead) != 1 || dead[0] != "edge-a" {
+		t.Fatalf("probe-confirmed forwarding-broken must fail over immediately, got %v", dead)
 	}
 }
