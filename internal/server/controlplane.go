@@ -447,13 +447,19 @@ func NewControlPlane(kv clientv3.KV, opt CPOptions) *ControlPlane {
 		if gerr == nil {
 			if !hadPrior {
 				cp.emitEdgeRegistered(edge, int64(capacityBps))
-				// A brand-new edge joins the universe and must be assigned to its
-				// covering coverer's tap — recompute + re-emit COVERAGE (debounced). A
-				// re-register (same edge) does not change the universe, so no recompute.
-				cp.scheduleCoverageRecompute()
 			} else if prior.CapacityBps != capacityBps {
 				cp.emitEdgeCapacityChanged(edge, int64(capacityBps))
 			}
+			// COLD-RESTART SELF-HEAL: recompute + re-emit COVERAGE on EVERY register, not
+			// just a brand-new edge. A re-register after a control-plane cold restart (the
+			// edge is already in the etcd inventory, so hadPrior is true) still needs
+			// coverage re-emitted: the freshly-restarted coverers recompute at their Watch
+			// connect, racing AHEAD of the edges re-registering (empty/partial universe),
+			// then never re-learn to tap this edge and reject its tap ("Can't find
+			// configuration for a new passive connection") until a manual coverer restart.
+			// Debounced by RunCoverageRecompute, so a burst of re-registers collapses to
+			// one recompute — cheap self-heal for the cold-restart convergence gap.
+			cp.scheduleCoverageRecompute()
 		}
 		log.Info("agent registered", "edge", edge, "capacity_bps", capacityBps, "sellable_tokens", tokens)
 		return nil
