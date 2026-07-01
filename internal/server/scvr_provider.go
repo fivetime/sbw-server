@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"time"
 
 	"github.com/fivetime/sbw-contract/model"
 	"github.com/fivetime/sbw-contract/rpc"
@@ -49,6 +50,13 @@ func (p *scvrProvider) Report(ctx context.Context, r *rpc.CovererReport) error {
 		if err := json.Unmarshal(r.Payload, &er); err != nil {
 			return err
 		}
+		// Continuous mis-home backstop: the agent reports through the coverer it homed to;
+		// if that is NOT this edge's HRW primary, it is parked on the wrong coverer (cold-
+		// start ordering black-hole) — REHOME it (rate-limited). The BGP tap keeps it "alive"
+		// so liveness never catches this; the periodic report is what heals it.
+		if primary := p.cp.fan.rehomeMisHome(er.EdgeID, r.CovererId, time.Now()); primary != "" {
+			p.cp.log.Info("agent report via non-primary coverer; rehoming", "edge", er.EdgeID, "on", r.CovererId, "primary", primary)
+		}
 		return p.cp.onReport(ctx, er)
 	case rpc.CovererReport_MEMBER_EDGE:
 		// The member→edge LOCALITY + member-liveness uplink: feed the server-side presence
@@ -68,6 +76,12 @@ func (p *scvrProvider) Report(ctx context.Context, r *rpc.CovererReport) error {
 		// dropped at the coverer, leaving the agent stuck awaiting a resync. Async (background
 		// ctx) so the Report stream is never blocked on the render+push (a store read).
 		edge := model.EdgeID(r.EdgeId)
+		// If the agent subscribed via a NON-primary coverer (cold-start ordering), REHOME it
+		// to its primary first — the RerenderEdge below routes to covers[0], so it only
+		// reaches the agent once it is on that coverer.
+		if primary := p.cp.fan.rehomeMisHome(edge, r.CovererId, time.Now()); primary != "" {
+			p.cp.log.Info("agent subscribed via non-primary coverer; rehoming", "edge", edge, "on", r.CovererId, "primary", primary)
+		}
 		go func() {
 			if err := p.cp.Orch.RerenderEdge(context.Background(), edge); err != nil {
 				p.cp.log.Warn("agent-subscribe rerender failed", "edge", edge, "err", err)

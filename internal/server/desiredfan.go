@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"sort"
 	"sync"
+	"time"
 
 	"github.com/fivetime/sbw-contract/model"
 	"github.com/fivetime/sbw-contract/rpc"
@@ -13,6 +14,12 @@ import (
 	"github.com/fivetime/sbw-server/internal/orchestrator"
 	"github.com/fivetime/sbw-server/internal/shard"
 )
+
+// misHomeRehomeInterval rate-limits the mis-home correction REHOME per edge (see
+// rehomeMisHome). The first detection REHOMEs immediately (fast self-heal); this only bounds
+// how often it re-fires for an edge whose primary stays unreachable, so a stuck primary does
+// not thrash the agent's control connection every report tick.
+const misHomeRehomeInterval = 15 * time.Second
 
 // seamBuffer is the per-coverer Watch channel depth. The seam NEVER drops (the
 // producer blocks on a full channel, see emit); this depth only bounds how much
@@ -62,6 +69,9 @@ type desiredFan struct {
 	// emits nothing and a coverer recovery migrates only the edges that actually moved.
 	// Guarded by mu.
 	lastPrimary map[string]string
+	// misHomeRehomedAt[edge] rate-limits the mis-home correction REHOME (rehomeMisHome) per
+	// edge. Guarded by mu.
+	misHomeRehomedAt map[string]time.Time
 	// k is the HRW replication factor over the CONNECTED coverer set: an edge routes
 	// to the top-k of the connected coverers, primary-first. Wired at construction
 	// from CPOptions.CoverageK (== the server's sharding K).
@@ -89,7 +99,13 @@ var (
 // stream is created fresh on its Watch connect (connectCoverer). k is the HRW
 // replication factor over the connected coverer set.
 func newDesiredFan(log *slog.Logger, k int) *desiredFan {
-	return &desiredFan{streams: map[string]*covererStream{}, lastPrimary: map[string]string{}, k: k, log: log}
+	return &desiredFan{
+		streams:          map[string]*covererStream{},
+		lastPrimary:      map[string]string{},
+		misHomeRehomedAt: map[string]time.Time{},
+		k:                k,
+		log:              log,
+	}
 }
 
 // notePrimary records the coverer an edge's agent was just told to home to (the Register
@@ -207,6 +223,42 @@ func (f *desiredFan) rehomeChangedPrimaries(edges []model.EdgeID) int {
 		}
 	}
 	return n
+}
+
+// rehomeMisHome corrects a MIS-HOMED agent: the report/subscribe for edge was relayed by
+// relayCoverer, but that is NOT the edge's current HRW primary (covers[0]) — where the
+// server routes its desired-state. So the agent is parked on the wrong coverer and is being
+// silently black-holed. The classic cause is a COLD-START ordering race: the agent registered
+// before ANY coverer had connected to the server, got an empty coverer-assignment (no primary
+// to home to), and stayed on whichever coverer the load-balanced bootstrap Service gave it.
+// The agent's BGP tap stays UP so liveness never fails it over — nothing else heals it. Fix:
+// REHOME the edge to its primary (broadcast to all covering coverers so it reaches the agent
+// on its current one). Rate-limited per edge (misHomeRehomeInterval) so a genuinely-
+// unreachable primary does not thrash the agent's control link. Returns the primary REHOMEd
+// to, or "" for a no-op (correctly homed / no coverer connected / rate-limited). This is
+// consistent with FAILOVER: it uses the LIVE connected-set assignment, so after the primary
+// coverer dies, the fallback becomes covers[0] and an agent already on it is NOT disturbed.
+func (f *desiredFan) rehomeMisHome(edge model.EdgeID, relayCoverer string, now time.Time) string {
+	if relayCoverer == "" {
+		return ""
+	}
+	a, ok := f.assignmentFor(edge) // takes f.mu
+	if !ok || len(a.Coverers) == 0 || relayCoverer == a.Coverers[0].ControllerID {
+		return "" // no coverer connected, or already on the primary
+	}
+	primary := a.Coverers[0].ControllerID
+	f.mu.Lock()
+	if last, seen := f.misHomeRehomedAt[string(edge)]; seen && now.Sub(last) < misHomeRehomeInterval {
+		f.mu.Unlock()
+		return "" // rate-limited
+	}
+	f.misHomeRehomedAt[string(edge)] = now
+	f.lastPrimary[string(edge)] = primary // keep the recompute path's baseline consistent
+	f.mu.Unlock()
+	if err := f.PushRehomeAll(edge, a); err != nil {
+		return ""
+	}
+	return primary
 }
 
 // streamForLocked returns the connected coverer stream serving edge: it resolves the

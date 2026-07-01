@@ -3,6 +3,7 @@ package server
 import (
 	"log/slog"
 	"testing"
+	"time"
 
 	"github.com/fivetime/sbw-contract/model"
 	"github.com/fivetime/sbw-contract/rpc"
@@ -166,5 +167,44 @@ func TestRehomeOnPrimaryFlip(t *testing.T) {
 	// First observation of an UNREGISTERED edge (no notePrimary): record baseline, no REHOME.
 	if n := f.rehomeChangedPrimaries([]model.EdgeID{model.EdgeID("neveredge")}); n != 0 {
 		t.Fatalf("unregistered edge first recompute should rehome nothing, got %d", n)
+	}
+}
+
+// TestRehomeMisHome proves the cold-start mis-home correction: an agent whose report/subscribe
+// is relayed by a NON-primary coverer is REHOMEd to its primary (broadcast reaches it), an
+// on-primary relay is a no-op, and the correction is rate-limited per edge so a stuck primary
+// cannot thrash.
+func TestRehomeMisHome(t *testing.T) {
+	f := newDesiredFan(slog.New(slog.DiscardHandler), 2)
+	addStream(f, "10.99.0.10", "coverer-0.sbw-system:1791")
+	addStream(f, "10.99.0.11", "coverer-1.sbw-system:1791")
+	edge := model.EdgeID("l1")
+	a, _ := f.assignmentFor(edge)
+	primary := a.Coverers[0].ControllerID
+	other := "10.99.0.10"
+	if primary == "10.99.0.10" {
+		other = "10.99.0.11"
+	}
+	t0 := time.Unix(1000, 0)
+
+	if got := f.rehomeMisHome(edge, "", t0); got != "" {
+		t.Fatalf("empty relay should no-op, got %q", got)
+	}
+	if got := f.rehomeMisHome(edge, primary, t0); got != "" {
+		t.Fatalf("relay==primary (correctly homed) should no-op, got %q", got)
+	}
+	if got := f.rehomeMisHome(edge, other, t0); got != primary {
+		t.Fatalf("mis-home should rehome to %s, got %q", primary, got)
+	}
+	if !drainRehome(f.streams[primary]) {
+		t.Fatalf("primary %s got no REHOME broadcast", primary)
+	}
+	drainRehome(f.streams[other]) // drain the cap-1 channel so the later emit doesn't block
+
+	if got := f.rehomeMisHome(edge, other, t0.Add(misHomeRehomeInterval/2)); got != "" {
+		t.Fatalf("within interval should be rate-limited, got %q", got)
+	}
+	if got := f.rehomeMisHome(edge, other, t0.Add(misHomeRehomeInterval*2)); got != primary {
+		t.Fatalf("after interval should rehome again, got %q", got)
 	}
 }
