@@ -334,7 +334,12 @@ func (m *Monitor) Health(edge model.EdgeID, softDead bool, fault model.FaultKind
 	s := m.get(edge)
 	s.healthDead = softDead
 	s.faultKind = fault
-	if !s.dataDead() {
+	dd := s.dataDead()
+	if softDead || fault != model.FaultNone {
+		m.log.Info("TRACE-HEALTH", "edge", edge, "softDead", softDead, "fault", fault,
+			"canaryDown", s.canaryDown, "healthDead", s.healthDead, "dataDead", dd, "failed", s.failed)
+	}
+	if !dd {
 		s.softSince = time.Time{} // predicate broken → reset the debounce
 	}
 	m.mu.Unlock()
@@ -462,6 +467,8 @@ func (m *Monitor) Tick(ctx context.Context) []model.EdgeID {
 		// is unchanged.
 		softFired := false
 		if s.dataDead() {
+			m.log.Info("TRACE-TICK dataDead", "edge", edge, "fault", s.faultKind,
+				"debounce", m.debounceFor(s.faultKind), "failed", s.failed, "everReported", s.everReported)
 			switch d := m.debounceFor(s.faultKind); {
 			case d <= 0:
 				softFired = true
