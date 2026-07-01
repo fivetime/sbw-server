@@ -175,9 +175,13 @@ func (f *desiredFan) PushRehomeAll(edge model.EdgeID, a model.CovererAssignment)
 }
 
 // emitToAllCovers pushes d to the Watch channel of EVERY connected covering coverer of edge
-// (the top-k HRW set), not just the primary. Used for REHOME (see PushRehomeAll). Same
-// blocks-never-drops channel discipline as emit, per coverer, with the per-stream done as
-// the release valve; the streams snapshot is taken under mu, the sends run after unlock.
+// (the top-k HRW set), not just the primary. Used for REHOME (see PushRehomeAll). Unlike the
+// desired-state emit (blocks-never-drops), this is NON-BLOCKING (drop-if-full): REHOME is
+// idempotent and re-fired (by the report-driven mis-home backstop and the coverage recompute),
+// so dropping one into a full/wedged channel is harmless — and critically, rehomeMisHome runs
+// INSIDE the coverer's Report handler, so a blocking send here would stall that coverer's whole
+// uplink (and, under a total restart, thrash its Watch stream). The streams snapshot is taken
+// under mu; the sends run after unlock.
 func (f *desiredFan) emitToAllCovers(edge model.EdgeID, d *rpc.Directive) {
 	f.mu.Lock()
 	ids := shard.Coverers(string(edge), f.connectedCovererIDsLocked(), f.k)
@@ -193,6 +197,7 @@ func (f *desiredFan) emitToAllCovers(edge model.EdgeID, d *rpc.Directive) {
 		select {
 		case s.ch <- a:
 		case <-s.done:
+		default: // channel full — drop; REHOME is idempotent and re-fired, never block the uplink
 		}
 	}
 }
