@@ -67,7 +67,7 @@ const (
 //     (no converged/timeout handshake) — Outcome/FromEdge/ToEdge are left empty.
 type Event struct {
 	RequestID  string  `json:"request_id"`
-	Op         string  `json:"op"` // open set: "create"|"update"|"destroy"|"migrate"|"decommission"|"failover"|"member-down"|"member-up"|"delivery-loss"|"program-drift"|"anchor-unprovisioned"|"anchor-rogue"|"edge-dataplane-down"|"edge-dataplane-up"|"metering-stale"|"metering-resumed"|"pool-double-death"|"pool-expired"|"member-evicted"|"edge-down"|"edge-up"|"edge-registered"|"edge-deregistered"|"edge-capacity-changed"|"redundancy-lost"|"redundancy-regained"|"backup-changed"|"capacity-exhausted"|"rehome"|"edge-forwarding-degraded"|"edge-forwarding-recovered"|…
+	Op         string  `json:"op"` // open set: "create"|"update"|"destroy"|"migrate"|"decommission"|"failover"|"member-down"|"member-up"|"delivery-loss"|"program-drift"|"anchor-unprovisioned"|"anchor-rogue"|"edge-dataplane-down"|"edge-dataplane-up"|"metering-stale"|"metering-resumed"|"pool-double-death"|"pool-expired"|"member-evicted"|"edge-down"|"edge-up"|"edge-registered"|"edge-deregistered"|"edge-capacity-changed"|"redundancy-lost"|"redundancy-regained"|"backup-changed"|"capacity-exhausted"|"rehome"|…
 	PoolID     uint64  `json:"pool_id"`
 	Edge       string  `json:"edge,omitempty"`    // the primary/home edge whose apply resolves an API-result op (member-down/up: the member's home edge)
 	Outcome    Outcome `json:"outcome,omitempty"` // "converged"|"failed" (API-result only; empty for failover / member-down/up)
@@ -128,15 +128,6 @@ type Event struct {
 	// Unlimited flags the CIR==0 / 95th-percentile pool (the sharp case ~0 tokens +
 	// 100G placeholder policer). Set on converged create/update only.
 	Unlimited bool `json:"unlimited,omitempty"`
-
-	// --- TIER 5 (per-member forwarding-loss, §4.2.5) fields (appended additively; do
-	// NOT renumber/reorder). All omitempty so every pre-TIER-5 event serializes unchanged.
-
-	// LossBps is a member's forwarding-loss in basis points (0..10000) carried by the
-	// edge-forwarding-degraded / edge-forwarding-recovered alert events and the
-	// loss-triggered "migrate" event (Reason="forwarding-loss"). The member is in
-	// MemberPrefix, the direction ("ingress"/"egress") + top drop reason in Reason.
-	LossBps uint16 `json:"loss_bps,omitempty"`
 }
 
 // Emitter ships an API-result Event. Emit MUST NOT block the caller (the report /
