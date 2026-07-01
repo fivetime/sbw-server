@@ -335,7 +335,7 @@ func TestSoftDeathNeedsBothSignals(t *testing.T) {
 		t.Fatalf("canary anomaly alone must not fail over, got %v", dead)
 	}
 	// Agent reports data-plane death too → conjunction starts; not yet past debounce.
-	m.Health("edge-a", true)
+	m.Health("edge-a", true, model.FaultNone)
 	if dead := m.Tick(ctx); len(dead) != 0 {
 		t.Fatalf("conjunction must debounce before firing, got %v", dead)
 	}
@@ -355,7 +355,7 @@ func TestSoftDeathResetsWhenSignalClears(t *testing.T) {
 
 	// Conjunction begins.
 	m.CanaryDown("edge-a")
-	m.Health("edge-a", true)
+	m.Health("edge-a", true, model.FaultNone)
 	if dead := m.Tick(ctx); len(dead) != 0 {
 		t.Fatal("debounce not elapsed yet")
 	}
@@ -378,10 +378,10 @@ func TestSoftDeathHealthRecoveryClears(t *testing.T) {
 	ctx := context.Background()
 	m.Heartbeat(ctx, "edge-a")
 	m.CanaryDown("edge-a")
-	m.Health("edge-a", true)
+	m.Health("edge-a", true, model.FaultNone)
 	c.add(5 * time.Second)
 	// Agent recovers (reports healthy) → conjunction broken.
-	m.Health("edge-a", false)
+	m.Health("edge-a", false, model.FaultNone)
 	c.add(20 * time.Second)
 	if dead := m.Tick(ctx); len(dead) != 0 {
 		t.Fatalf("health recovery must clear soft-death, got %v", dead)
@@ -541,5 +541,109 @@ func TestHeartbeatStaleRequiresEverReported(t *testing.T) {
 	c.add(31 * time.Second)
 	if dead := m.Tick(ctx); len(dead) != 1 || dead[0] != "edge-x" {
 		t.Fatalf("reported-then-silent edge must be heartbeat-staled, got %v", dead)
+	}
+}
+
+// --- §4.2.4 fault-kind soft-death routing ---------------------------------
+
+// A vpp-gone typed fault fails over on the agent's report ALONE (no canary
+// conjunction — a crashed VPP does not withdraw the kernel-borne ctap canary), but
+// only after the restart grace, since VPP may be relaunched and self-heal in place.
+func TestFaultVPPGoneUsesRestartGraceNoCanary(t *testing.T) {
+	r := &recorder{}
+	c := &clk{t: time.Unix(1_700_000_000, 0)}
+	m := New(time.Hour, r.onFailover, WithClock(c.now), WithRevive(r.onRevive),
+		WithSoftDebounce(30*time.Second), WithRestartGrace(5*time.Second))
+	ctx := context.Background()
+	m.Heartbeat(ctx, "edge-a")
+
+	// No canary anomaly at all — just the typed report.
+	m.Health("edge-a", true, model.FaultVPPGone)
+	if dead := m.Tick(ctx); len(dead) != 0 {
+		t.Fatalf("vpp-gone must still honour the restart grace, got %v", dead)
+	}
+	// Past the 5s restart grace (but well under the 30s softDebounce) → fires.
+	c.add(6 * time.Second)
+	if dead := m.Tick(ctx); len(dead) != 1 || dead[0] != "edge-a" {
+		t.Fatalf("vpp-gone must fail over after the restart grace, got %v", dead)
+	}
+}
+
+// A vpp-gone edge whose VPP relaunches (agent reports healthy again) inside the
+// restart grace must NOT fail over — the point of the grace.
+func TestFaultVPPGoneSelfHealsWithinGrace(t *testing.T) {
+	r := &recorder{}
+	c := &clk{t: time.Unix(1_700_000_000, 0)}
+	m := New(time.Hour, r.onFailover, WithClock(c.now), WithRestartGrace(5*time.Second))
+	ctx := context.Background()
+	m.Heartbeat(ctx, "edge-a")
+
+	m.Health("edge-a", true, model.FaultVPPGone)
+	c.add(3 * time.Second)                     // within grace
+	m.Health("edge-a", false, model.FaultNone) // VPP back
+	c.add(10 * time.Second)
+	if dead := m.Tick(ctx); len(dead) != 0 {
+		t.Fatalf("vpp recovered within grace must not fail over, got %v", dead)
+	}
+}
+
+// A link-down typed fault fires IMMEDIATELY (0 debounce) on the report alone — a
+// pulled uplink won't heal itself and doesn't withdraw the canary.
+func TestFaultLinkDownFiresImmediatelyNoCanary(t *testing.T) {
+	r := &recorder{}
+	c := &clk{t: time.Unix(1_700_000_000, 0)}
+	m := New(time.Hour, r.onFailover, WithClock(c.now),
+		WithSoftDebounce(30*time.Second), WithRestartGrace(5*time.Second))
+	ctx := context.Background()
+	m.Heartbeat(ctx, "edge-a")
+
+	m.Health("edge-a", true, model.FaultLinkDown) // no canary, no wait
+	if dead := m.Tick(ctx); len(dead) != 1 || dead[0] != "edge-a" {
+		t.Fatalf("link-down must fail over immediately, got %v", dead)
+	}
+}
+
+// An unclassified fault (FaultNone) keeps the §4.7 canary∧health conjunction AND the
+// full softDebounce — a pre-§4.2 agent is unchanged. Health alone must NOT fire.
+func TestFaultNoneKeepsConjunctionAndSoftDebounce(t *testing.T) {
+	r := &recorder{}
+	c := &clk{t: time.Unix(1_700_000_000, 0)}
+	m := New(time.Hour, r.onFailover, WithClock(c.now),
+		WithSoftDebounce(10*time.Second), WithRestartGrace(5*time.Second))
+	ctx := context.Background()
+	m.Heartbeat(ctx, "edge-a")
+
+	// Health alone (no canary) — the conjunction requires the canary, so no fire even
+	// past the restart grace (proving FaultNone did NOT take the vpp-gone fast path).
+	m.Health("edge-a", true, model.FaultNone)
+	c.add(6 * time.Second)
+	if dead := m.Tick(ctx); len(dead) != 0 {
+		t.Fatalf("FaultNone health-alone must not fire, got %v", dead)
+	}
+	// Add the canary → conjunction holds; still must ride the full 10s softDebounce.
+	m.CanaryDown("edge-a")
+	if dead := m.Tick(ctx); len(dead) != 0 {
+		t.Fatalf("FaultNone conjunction must debounce, got %v", dead)
+	}
+	c.add(11 * time.Second)
+	if dead := m.Tick(ctx); len(dead) != 1 || dead[0] != "edge-a" {
+		t.Fatalf("FaultNone conjunction must fire after softDebounce, got %v", dead)
+	}
+}
+
+// A forwarding-broken fault falls through to the default branch: the full
+// conjunction + softDebounce (its own active-probe fast path is §4.2.4 future work).
+func TestFaultForwardingBrokenUsesDefault(t *testing.T) {
+	r := &recorder{}
+	c := &clk{t: time.Unix(1_700_000_000, 0)}
+	m := New(time.Hour, r.onFailover, WithClock(c.now),
+		WithSoftDebounce(10*time.Second), WithRestartGrace(5*time.Second))
+	ctx := context.Background()
+	m.Heartbeat(ctx, "edge-a")
+
+	m.Health("edge-a", true, model.FaultForwardingBroken)
+	c.add(6 * time.Second) // past restart grace — must NOT fire (needs canary + softDebounce)
+	if dead := m.Tick(ctx); len(dead) != 0 {
+		t.Fatalf("forwarding-broken without canary must not fire, got %v", dead)
 	}
 }

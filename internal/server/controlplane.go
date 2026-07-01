@@ -243,6 +243,12 @@ type CPOptions struct {
 	// persist before failover fires. 0 → default 3s. Damps a recovering edge whose
 	// tap flaps up→down→up during its own re-convergence from re-firing a failover.
 	LivenessHardDebounce time.Duration
+	// LivenessVPPRestartGrace is the §4.2.4 hold-down for a vpp-gone typed fault
+	// before soft-death failover — a crashed VPP may be relaunched and self-heal in
+	// place. 0 → default 5s. Distinct from LivenessSoftDebounce (which stays the
+	// hold-down for ambiguous/untyped soft death); a link-down typed fault fires
+	// immediately with no configurable grace (a dead uplink won't heal itself).
+	LivenessVPPRestartGrace time.Duration
 	// LivenessQuorum is how many distinct coverers must observe an edge's session
 	// down before HARD-death failover fires (L-03 corroborated failover, multihop
 	// BFD). 0/1 → immediate (single PeerDown), the single-controller/single-hop
@@ -455,8 +461,8 @@ func NewControlPlane(kv clientv3.KV, opt CPOptions) *ControlPlane {
 
 	userReport := opt.OnReport
 	onReport := func(ctx context.Context, r model.EdgeReport) error {
-		mon.Heartbeat(ctx, r.EdgeID)              // every report is a heartbeat (agent alive)
-		mon.Health(r.EdgeID, r.Health.SoftDead()) // self-reported data-plane death (§4.7 soft half)
+		mon.Heartbeat(ctx, r.EdgeID)                                  // every report is a heartbeat (agent alive)
+		mon.Health(r.EdgeID, r.Health.SoftDead(), r.Health.FaultKind) // self-reported data-plane death (§4.7 soft half) + §4.2.3 typed fault
 		// TIER-1 edge-dataplane transition: r.Health.State==HealthDataPlaneDown means VPP
 		// is dead while BGP/canary may still be up (billing while black-holing, invisible
 		// to BGP). Convert the per-report LEVEL into an EDGE — emit only on up→down /
@@ -616,6 +622,7 @@ func NewControlPlane(kv clientv3.KV, opt CPOptions) *ControlPlane {
 		liveness.WithDeathNotify(cp.onEdgeDeath),
 		liveness.WithSoftDebounce(opt.LivenessSoftDebounce),
 		liveness.WithHardDebounce(opt.LivenessHardDebounce),
+		liveness.WithRestartGrace(opt.LivenessVPPRestartGrace),
 		liveness.WithQuorum(opt.LivenessQuorum),
 		liveness.WithSelfID(opt.SelfID),
 		liveness.WithReporting(reporting),

@@ -90,18 +90,19 @@ func main() {
 
 	met := metrics.New()
 	cp := server.NewControlPlane(cli, server.CPOptions{
-		Prefix:               cfg.Etcd.Prefix,
-		ReservationTTL:       time.Duration(cfg.Etcd.ReservationTTL),
-		Replicas:             cfg.Replicas,
-		EdgeAddrs:            edgeAddrs,
-		EdgeAddrs6:           edgeAddrs6,
-		LivenessQuorum:       sh.FailoverQuorum,
-		LivenessHardDebounce: time.Duration(sh.HardDebounce),
-		CoverageK:            sh.K,
-		SelfID:               selfID,
-		HomeMarker:           homeMarkerFn(cfg.HomeMarker),
-		Metrics:              met,
-		Logger:               log,
+		Prefix:                  cfg.Etcd.Prefix,
+		ReservationTTL:          time.Duration(cfg.Etcd.ReservationTTL),
+		Replicas:                cfg.Replicas,
+		EdgeAddrs:               edgeAddrs,
+		EdgeAddrs6:              edgeAddrs6,
+		LivenessQuorum:          sh.FailoverQuorum,
+		LivenessHardDebounce:    time.Duration(sh.HardDebounce),
+		LivenessVPPRestartGrace: time.Duration(sh.VPPRestartGrace),
+		CoverageK:               sh.K,
+		SelfID:                  selfID,
+		HomeMarker:              homeMarkerFn(cfg.HomeMarker),
+		Metrics:                 met,
+		Logger:                  log,
 	})
 
 	// YugabyteDB is MANDATORY: pools/members live in YSQL and there is NO retreat to an

@@ -50,6 +50,7 @@ type Monitor struct {
 	grace        time.Duration
 	softDebounce time.Duration
 	hardDebounce time.Duration // hold-down: hard-death quorum must persist this long before failover (0 = immediate); damps a recovering edge's tap flap
+	restartGrace time.Duration // §4.2.4 vpp-gone hold-down: a crashed VPP may be relaunched+self-heal in place, so wait this long before soft-death failover (0 → 5s)
 	startupGrace time.Duration // first-convergence grace (L-03 churn fix); see readyAt
 	readyAt      time.Time     // hard-death verdicts/votes trusted only at/after this
 	quorum       int           // coverer votes needed to judge hard-death (L-03); >=1
@@ -80,7 +81,8 @@ type state struct {
 	hardVotes    map[string]bool // coverer ids that observed PeerDown (HARD death votes, L-03)
 	canaryDown   bool            // tap: canary withdrawn while session up (SOFT signal)
 	healthDead   bool            // agent reported HealthDataPlaneDown (SOFT signal)
-	softSince    time.Time       // when the soft-death conjunction (canary∧health) began; zero = not currently
+	faultKind    model.FaultKind // §4.2 agent-typed edge fault (from HealthReport.FaultKind); routes the soft-death speed
+	softSince    time.Time       // when the soft-death predicate (dataDead) began; zero = not currently
 	hardSince    time.Time       // when the hard-death quorum was first reached (hold-down debounce); zero = not currently
 	failed       bool            // failover already fired (don't re-fire until revived)
 	everReported bool            // has sent ≥1 EdgeReport to THIS controller (L-10: never fail over an edge we've never heard from)
@@ -113,6 +115,40 @@ func (m *Monitor) hardDead(s *state) bool { return m.ready() && len(s.hardVotes)
 // anomaly AND the agent reports its data plane dead. Either alone is not enough
 // (avoids a false withdrawal from a tap flap or a single bad report).
 func (s *state) softDead() bool { return s.canaryDown && s.healthDead }
+
+// dataDead is the §4.2 fault-aware soft-death predicate that supersedes softDead()
+// on the failover path. For an UNAMBIGUOUS agent-typed fault (vpp-gone / link-down)
+// the agent's direct healthDead report is trustworthy on its own — no canary
+// conjunction, because a pulled uplink or a crashed VPP does not withdraw the tap
+// canary (the canary rides the kernel ctap, which survives both). For an ambiguous
+// or unclassified fault (forwarding-broken / loss / a pre-§4.2 agent reporting
+// FaultNone) it keeps the §4.7 canary∧health conjunction so one bad report alone
+// never fires. Backward-compatible: FaultNone → softDead(), the original behaviour.
+func (s *state) dataDead() bool {
+	switch s.faultKind {
+	case model.FaultVPPGone, model.FaultLinkDown:
+		return s.healthDead
+	default:
+		return s.softDead()
+	}
+}
+
+// debounceFor is the §4.2.4 per-fault-kind hold-down before soft-death failover.
+// Unambiguous faults fire fast — link-down immediately (a dead uplink won't heal
+// itself), vpp-gone after a short restart grace (a crashed VPP may be relaunched by
+// kubelet/supervisor and self-heal in place). Everything else (forwarding-broken,
+// loss-degraded, and FaultNone from a pre-§4.2 agent) keeps the full softDebounce,
+// so there is no regression for edges that don't type their fault.
+func (m *Monitor) debounceFor(f model.FaultKind) time.Duration {
+	switch f {
+	case model.FaultLinkDown:
+		return 0
+	case model.FaultVPPGone:
+		return m.restartGrace
+	default:
+		return m.softDebounce
+	}
+}
 
 // Option configures a Monitor.
 type Option func(*Monitor)
@@ -151,6 +187,11 @@ func WithSoftDebounce(d time.Duration) Option { return func(m *Monitor) { m.soft
 // failover fires (0 = immediate, the default). Damps a recovering edge whose tap
 // flaps up→down→up during its own re-convergence from re-firing a failover.
 func WithHardDebounce(d time.Duration) Option { return func(m *Monitor) { m.hardDebounce = d } }
+
+// WithRestartGrace sets the §4.2.4 hold-down for a vpp-gone fault before soft-death
+// failover — a crashed VPP may be relaunched (kubelet/supervisor) and self-heal in
+// place, so a short grace avoids evacuating an edge that recovers on its own. 0 → 5s.
+func WithRestartGrace(d time.Duration) Option { return func(m *Monitor) { m.restartGrace = d } }
 
 // WithLogger sets the logger.
 func WithLogger(l *slog.Logger) Option { return func(m *Monitor) { m.log = l } }
@@ -206,6 +247,9 @@ func New(grace time.Duration, onFailover ActionFunc, opts ...Option) *Monitor {
 			m.softDebounce = 5 * time.Second
 		}
 	}
+	if m.restartGrace == 0 {
+		m.restartGrace = 5 * time.Second
+	}
 	if m.quorum < 1 {
 		m.quorum = 1
 	}
@@ -242,6 +286,7 @@ func (m *Monitor) Alive(ctx context.Context, edge model.EdgeID) {
 	s.hardVotes = map[string]bool{}
 	s.canaryDown = false
 	s.healthDead = false
+	s.faultKind = model.FaultNone
 	s.softSince = time.Time{}
 	revived := s.failed
 	s.failed = false
@@ -261,7 +306,7 @@ func (m *Monitor) Heartbeat(ctx context.Context, edge model.EdgeID) {
 	s := m.get(edge)
 	s.lastSeen = m.now()
 	s.everReported = true // L-10: we've now heard from this edge — it becomes death-eligible
-	revived := s.failed && !m.hardDead(s) && !s.softDead()
+	revived := s.failed && !m.hardDead(s) && !s.dataDead()
 	if revived {
 		s.failed = false
 	}
@@ -274,15 +319,20 @@ func (m *Monitor) Heartbeat(ctx context.Context, edge model.EdgeID) {
 }
 
 // Health folds an agent's self-reported data-plane health (B-05): softDead=true
-// when the agent says HealthDataPlaneDown. It is one half of the §4.7 soft-death
-// conjunction — on its own it never fails over (a single bad report could be a
-// false positive); it must coincide with a tap canary anomaly.
-func (m *Monitor) Health(edge model.EdgeID, softDead bool) {
+// when the agent says HealthDataPlaneDown, and fault is the agent-typed fault kind
+// (§4.2.3, FaultNone from a pre-§4.2 agent). The death predicate it feeds is
+// dataDead(): for an ambiguous/unclassified fault it is one half of the §4.7
+// soft-death conjunction — on its own it never fails over (a single bad report could
+// be a false positive), it must coincide with a tap canary anomaly; for an
+// unambiguous typed fault (vpp-gone / link-down) the report is trusted on its own
+// and routed to its own §4.2.4 debounce.
+func (m *Monitor) Health(edge model.EdgeID, softDead bool, fault model.FaultKind) {
 	m.mu.Lock()
 	s := m.get(edge)
 	s.healthDead = softDead
-	if !s.softDead() {
-		s.softSince = time.Time{} // conjunction broken → reset the debounce
+	s.faultKind = fault
+	if !s.dataDead() {
+		s.softSince = time.Time{} // predicate broken → reset the debounce
 	}
 	m.mu.Unlock()
 }
@@ -402,13 +452,19 @@ func (m *Monitor) Tick(ctx context.Context) []model.EdgeID {
 			staleLevels[edge] = stale
 		}
 
-		// Soft-death conjunction with debounce: track when it began, fire once it
-		// has persisted; reset the moment either half clears.
+		// Soft-death predicate with a per-fault-kind debounce (§4.2.4): track when it
+		// began, fire once it has persisted past the kind's hold-down; reset the moment
+		// it clears. debounceFor routes link-down→immediate, vpp-gone→restartGrace, and
+		// everything else (incl. FaultNone) → the full softDebounce, so a pre-§4.2 agent
+		// is unchanged.
 		softFired := false
-		if s.softDead() {
-			if s.softSince.IsZero() {
+		if s.dataDead() {
+			switch d := m.debounceFor(s.faultKind); {
+			case d <= 0:
+				softFired = true
+			case s.softSince.IsZero():
 				s.softSince = now
-			} else if now.Sub(s.softSince) > m.softDebounce {
+			case now.Sub(s.softSince) >= d:
 				softFired = true
 			}
 		} else {

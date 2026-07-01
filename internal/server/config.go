@@ -117,6 +117,9 @@ type ShardingConfig struct {
 	// HardDebounce is a hold-down the HARD-death quorum must persist before failover,
 	// damping a recovering edge whose tap flaps. 0 → 3s.
 	HardDebounce config.Duration `json:"hard_debounce"`
+	// VPPRestartGrace is the §4.2.4 hold-down for a vpp-gone typed soft-death fault
+	// before failover — a crashed VPP may be relaunched and self-heal in place. 0 → 5s.
+	VPPRestartGrace config.Duration `json:"vpp_restart_grace"`
 }
 
 // WithDefaults returns the sharding config with zero fields filled in.
@@ -138,6 +141,9 @@ func (s ShardingConfig) WithDefaults() ShardingConfig {
 	}
 	if s.HardDebounce == 0 {
 		s.HardDebounce = config.Duration(3 * time.Second)
+	}
+	if s.VPPRestartGrace == 0 {
+		s.VPPRestartGrace = config.Duration(5 * time.Second)
 	}
 	return s
 }
@@ -240,6 +246,9 @@ func (c *ServerConfig) applyEnv() error {
 		return err
 	}
 	if c.Sharding.HardDebounce, err = config.DurationEnv("SHARDING_HARD_DEBOUNCE", c.Sharding.HardDebounce); err != nil {
+		return err
+	}
+	if c.Sharding.VPPRestartGrace, err = config.DurationEnv("SHARDING_VPP_RESTART_GRACE", c.Sharding.VPPRestartGrace); err != nil {
 		return err
 	}
 
