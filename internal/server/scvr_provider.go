@@ -50,10 +50,6 @@ func (p *scvrProvider) Report(ctx context.Context, r *rpc.CovererReport) error {
 		if err := json.Unmarshal(r.Payload, &er); err != nil {
 			return err
 		}
-		if er.Health.FaultKind != model.FaultNone || er.Health.State == model.HealthDataPlaneDown {
-			p.cp.log.Info("TRACE-DISPATCH AGENT_REPORT fault", "edge", er.EdgeID, "coverer", r.CovererId,
-				"state", er.Health.State, "fault", er.Health.FaultKind)
-		}
 		// Continuous mis-home backstop: the agent reports through the coverer it homed to;
 		// if that is NOT this edge's HRW primary, it is parked on the wrong coverer (cold-
 		// start ordering black-hole) — REHOME it (rate-limited). The BGP tap keeps it "alive"

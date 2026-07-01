@@ -461,11 +461,7 @@ func NewControlPlane(kv clientv3.KV, opt CPOptions) *ControlPlane {
 
 	userReport := opt.OnReport
 	onReport := func(ctx context.Context, r model.EdgeReport) error {
-		mon.Heartbeat(ctx, r.EdgeID) // every report is a heartbeat (agent alive)
-		if r.Health.FaultKind != model.FaultNone || r.Health.State == model.HealthDataPlaneDown {
-			log.Info("TRACE-REPORT fault/dpdown received", "edge", r.EdgeID,
-				"state", r.Health.State, "fault", r.Health.FaultKind, "softdead", r.Health.SoftDead())
-		}
+		mon.Heartbeat(ctx, r.EdgeID)                                  // every report is a heartbeat (agent alive)
 		mon.Health(r.EdgeID, r.Health.SoftDead(), r.Health.FaultKind) // self-reported data-plane death (§4.7 soft half) + §4.2.3 typed fault
 		// TIER-1 edge-dataplane transition: r.Health.State==HealthDataPlaneDown means VPP
 		// is dead while BGP/canary may still be up (billing while black-holing, invisible
