@@ -86,6 +86,7 @@ func main() {
 
 	// The server is ALWAYS the HA brain: K=2 coverage + corroborated failover quorum.
 	sh := cfg.Sharding.WithDefaults()
+	lc := cfg.Loss.WithDefaults() // §4.2.5 per-member forwarding-loss policy thresholds
 	selfID := sh.ResolveReplicaID(cfg.ReplicaID)
 
 	met := metrics.New()
@@ -98,6 +99,9 @@ func main() {
 		LivenessQuorum:          sh.FailoverQuorum,
 		LivenessHardDebounce:    time.Duration(sh.HardDebounce),
 		LivenessVPPRestartGrace: time.Duration(sh.VPPRestartGrace),
+		LossAlertPct:            lc.AlertPct,
+		LossMigratePct:          lc.MigratePct,
+		LossMigrateSustain:      time.Duration(lc.MigrateSustain),
 		CoverageK:               sh.K,
 		SelfID:                  selfID,
 		HomeMarker:              homeMarkerFn(cfg.HomeMarker),
@@ -195,6 +199,8 @@ func main() {
 	// Reconcilers (§4.3/§5.9/§6.5/B-02/L-04/L-07/T-706).
 	go cp.RunReclaim(ctx, 10*time.Second)
 	go cp.RunLiveness(ctx, 5*time.Second)
+	go cp.RunLoss(ctx, 10*time.Second) // §4.2.5 per-member forwarding-loss sustain sweep
+
 	go cp.RunDriftSweep(ctx, time.Duration(cfg.DriftSweepInterval))
 	go cp.RunReconcileAccounts(ctx, 30*time.Second)
 	go cp.RunReconcileProgram(ctx, 30*time.Second)

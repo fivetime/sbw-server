@@ -63,6 +63,10 @@ type ServerConfig struct {
 	// is ALWAYS the HA brain — there is no Enabled toggle).
 	Sharding ShardingConfig `json:"sharding"`
 
+	// Loss carries the §4.2.5 per-member forwarding-loss policy thresholds (the alert
+	// vs migrate watermarks + the migrate sustain window). Orthogonal to Sharding.
+	Loss LossConfig `json:"loss"`
+
 	// RedpandaBrokers are the bootstrap brokers for the ASYNC API-result event stream.
 	// EMPTY ⇒ the feature is DISABLED (a Noop emitter is wired).
 	RedpandaBrokers []string `json:"redpanda_brokers"`
@@ -146,6 +150,39 @@ func (s ShardingConfig) WithDefaults() ShardingConfig {
 		s.VPPRestartGrace = config.Duration(5 * time.Second)
 	}
 	return s
+}
+
+// LossConfig carries the §4.2.5 per-member forwarding-loss policy (DESIGN-liveness):
+// the agent measures per-member loss and reports it; the SERVER holds these thresholds
+// and the sustain window and decides alert vs per-pool migrate. Percentages, not basis
+// points, in the config surface (operator-facing); converted to bps (×100) when the
+// loss monitor is built.
+type LossConfig struct {
+	// AlertPct is the loss percentage (0..100) at/above which a member is flagged
+	// degraded and a Redpanda edge-forwarding-degraded event fires for human triage.
+	// 0 → 15. A member below AlertPct is healthy; nothing is emitted.
+	AlertPct int `json:"alert_pct"`
+	// MigratePct is the loss percentage (0..100) at/above which — sustained for
+	// MigrateSustain — the member's POOL is migrated off its lossy home (promote the
+	// backup). 0 → 30. Must be >= AlertPct (a migrate always alerts first).
+	MigratePct int `json:"migrate_pct"`
+	// MigrateSustain is how long loss must stay at/above MigratePct before the migrate
+	// fires — the "don't evacuate on a transient spike" hold-down. 0 → 5m.
+	MigrateSustain config.Duration `json:"migrate_sustain"`
+}
+
+// WithDefaults returns the loss config with zero fields filled in.
+func (l LossConfig) WithDefaults() LossConfig {
+	if l.AlertPct == 0 {
+		l.AlertPct = 15
+	}
+	if l.MigratePct == 0 {
+		l.MigratePct = 30
+	}
+	if l.MigrateSustain == 0 {
+		l.MigrateSustain = config.Duration(5 * time.Minute)
+	}
+	return l
 }
 
 // ResolveReplicaID returns the server replica's id: the explicit replicaID, else a
@@ -251,6 +288,15 @@ func (c *ServerConfig) applyEnv() error {
 	if c.Sharding.VPPRestartGrace, err = config.DurationEnv("SHARDING_VPP_RESTART_GRACE", c.Sharding.VPPRestartGrace); err != nil {
 		return err
 	}
+	if c.Loss.AlertPct, err = config.Int("LOSS_ALERT_PCT", c.Loss.AlertPct); err != nil {
+		return err
+	}
+	if c.Loss.MigratePct, err = config.Int("LOSS_MIGRATE_PCT", c.Loss.MigratePct); err != nil {
+		return err
+	}
+	if c.Loss.MigrateSustain, err = config.DurationEnv("LOSS_MIGRATE_SUSTAIN", c.Loss.MigrateSustain); err != nil {
+		return err
+	}
 
 	c.RedpandaBrokers = config.Strings("REDPANDA_BROKERS", c.RedpandaBrokers)
 	c.APIResultsTopic = config.String("API_RESULTS_TOPIC", c.APIResultsTopic)
@@ -288,6 +334,18 @@ func (c ServerConfig) Validate() error {
 	}
 	if c.Sharding.K < 0 {
 		return fmt.Errorf("server config: sharding.k must be >= 0, got %d", c.Sharding.K)
+	}
+	// Loss thresholds are percentages; a migrate must not fire before an alert. Checked
+	// on the RAW config (0 = "use the default", filled by WithDefaults later), so only a
+	// genuinely-set out-of-range / inverted pair is rejected.
+	if c.Loss.AlertPct < 0 || c.Loss.AlertPct > 100 {
+		return fmt.Errorf("server config: loss.alert_pct must be 0..100, got %d", c.Loss.AlertPct)
+	}
+	if c.Loss.MigratePct < 0 || c.Loss.MigratePct > 100 {
+		return fmt.Errorf("server config: loss.migrate_pct must be 0..100, got %d", c.Loss.MigratePct)
+	}
+	if c.Loss.AlertPct != 0 && c.Loss.MigratePct != 0 && c.Loss.MigratePct < c.Loss.AlertPct {
+		return fmt.Errorf("server config: loss.migrate_pct (%d) must be >= loss.alert_pct (%d)", c.Loss.MigratePct, c.Loss.AlertPct)
 	}
 	return nil
 }

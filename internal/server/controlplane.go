@@ -2,6 +2,8 @@ package server
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"log/slog"
 	"net/netip"
 	"sync"
@@ -17,6 +19,7 @@ import (
 	"github.com/fivetime/sbw-server/internal/edgever"
 	"github.com/fivetime/sbw-server/internal/ledger"
 	"github.com/fivetime/sbw-server/internal/liveness"
+	"github.com/fivetime/sbw-server/internal/lossmon"
 	"github.com/fivetime/sbw-server/internal/orchestrator"
 	"github.com/fivetime/sbw-server/internal/registry"
 	"github.com/fivetime/sbw-server/internal/shard"
@@ -60,6 +63,7 @@ type ControlPlane struct {
 	YBCap    orchestrator.CapacityProvider
 	Orch     *orchestrator.Orchestrator
 	Liveness *liveness.Monitor
+	Loss     *lossmon.Monitor                              // §4.2.5 per-member forwarding-loss policy (alert / per-pool migrate)
 	scvr     *scvrProvider                                 // server-half of the ServerCoverer contract (Report/Register); the gRPC handlers delegate to it
 	onReport func(context.Context, model.EdgeReport) error // server-half report processing, invoked via the seam
 	// onRegister / covererFunc are the server-half halves of registration the seam's
@@ -249,6 +253,15 @@ type CPOptions struct {
 	// hold-down for ambiguous/untyped soft death); a link-down typed fault fires
 	// immediately with no configurable grace (a dead uplink won't heal itself).
 	LivenessVPPRestartGrace time.Duration
+	// LossAlertPct / LossMigratePct are the §4.2.5 per-member forwarding-loss policy
+	// watermarks as PERCENTAGES (0..100). A member at/above LossAlertPct emits a
+	// Redpanda edge-forwarding-degraded event (human triage); at/above LossMigratePct
+	// sustained LossMigrateSustain, its POOL is migrated off the lossy home. 0 → 15 / 30.
+	LossAlertPct   int
+	LossMigratePct int
+	// LossMigrateSustain is how long loss must stay at/above LossMigratePct before the
+	// per-pool migrate fires (the transient-spike hold-down). 0 → 5m.
+	LossMigrateSustain time.Duration
 	// LivenessQuorum is how many distinct coverers must observe an edge's session
 	// down before HARD-death failover fires (L-03 corroborated failover, multihop
 	// BFD). 0/1 → immediate (single PeerDown), the single-controller/single-hop
@@ -331,6 +344,17 @@ func NewControlPlane(kv clientv3.KV, opt CPOptions) *ControlPlane {
 
 	if opt.LivenessGrace == 0 {
 		opt.LivenessGrace = 30 * time.Second
+	}
+	// §4.2.5 loss-policy defaults (a direct NewControlPlane caller / test may leave them
+	// zero; the cmd passes LossConfig.WithDefaults, so these agree with config.go).
+	if opt.LossAlertPct == 0 {
+		opt.LossAlertPct = 15
+	}
+	if opt.LossMigratePct == 0 {
+		opt.LossMigratePct = 30
+	}
+	if opt.LossMigrateSustain == 0 {
+		opt.LossMigrateSustain = 5 * time.Minute
 	}
 	// LivenessHardDebounce defaults to 0 = immediate hard-death (DESIGN §6.5: a tap
 	// PeerDown quorum is unambiguous). It is opt-in (sharding.hard_debounce) for the
@@ -468,6 +492,11 @@ func NewControlPlane(kv clientv3.KV, opt CPOptions) *ControlPlane {
 		// to BGP). Convert the per-report LEVEL into an EDGE — emit only on up→down /
 		// down→up, not every report. Async / Noop-safe.
 		cp.emitEdgeDataplane(r.EdgeID, r.Health.State == model.HealthDataPlaneDown)
+		// §4.2.5 per-member forwarding-loss: fold the edge's loss snapshot (members over
+		// the agent watermark) into the loss monitor's sustain windows. RunLoss.Tick
+		// fires the alert / per-pool migrate; absence of a member = recovered. Nil-safe
+		// (empty MemberLoss = a clean snapshot that recovers any tracked member).
+		cp.ingestMemberLoss(r)
 		reports.put(r) // cache for account reconciliation (§4.3)
 		// API-RESULT CONVERGENCE: the report echoes the applied desired-state generation
 		// (r.Generation). Resolve any pending create/update/destroy whose home is this
@@ -558,6 +587,13 @@ func NewControlPlane(kv clientv3.KV, opt CPOptions) *ControlPlane {
 	// synchronous orch.FailoverEdge can only push to streams on THIS replica.
 	failover := func(ctx context.Context, edge model.EdgeID) {
 		opt.Metrics.Failover()
+		// The dead edge's pools are moving off it; drop its per-member loss sustain
+		// windows so a stale >30% spell can't later fire a redundant per-pool migrate
+		// against an edge that no longer homes those members (§4.2.5). Idempotent even
+		// without this (migrateMemberPool re-checks the home), but keeps state tidy.
+		if cp.Loss != nil {
+			cp.Loss.Forget(edge)
+		}
 		if cp.edgever != nil {
 			// BULK fast path (L-07): re-home ALL the dead edge's pools in parallel +
 			// ONE coalesced edgever bump per new-primary edge, instead of enqueuing each
@@ -631,6 +667,15 @@ func NewControlPlane(kv clientv3.KV, opt CPOptions) *ControlPlane {
 
 	cp.Orch = orch
 	cp.Liveness = mon
+	// §4.2.5 per-member loss policy: pct→basis-points (×100). onMigrate resolves
+	// member→pool and gracefully promotes its backup; onAlert emits the Redpanda
+	// edge-forwarding-degraded/-recovered event. Inert until an agent reports MemberLoss.
+	cp.Loss = lossmon.New(
+		uint16(opt.LossAlertPct*100), uint16(opt.LossMigratePct*100), opt.LossMigrateSustain,
+		cp.migrateMemberPool,
+		lossmon.WithClock(cp.now),
+		lossmon.WithAlert(cp.emitForwardingDegraded),
+		lossmon.WithLogger(log))
 	cp.fan = fan // server-half desired-state fan (the ServerCoverer WATCH downlink)
 	// COVERER ASSIGNMENT default: the agent's coverer set is derived from the SAME
 	// connected-coverer HRW the desired-state routing uses (fan.assignmentFor) — so an agent
@@ -1547,6 +1592,117 @@ func (cp *ControlPlane) emitMeteringStale(edge model.EdgeID, stale bool) {
 		Edge:      string(edge),
 		Reason:    reason,
 		TSUnixMs:  cp.now().UnixMilli(),
+	})
+}
+
+// ingestMemberLoss folds an edge report's per-member forwarding-loss vector (§4.2.5)
+// into the loss monitor. The vector is the edge's FULL set of members over the agent
+// watermark; RunLoss.Tick then fires the alert / per-pool migrate. A report with no
+// MemberLoss is a clean snapshot that recovers any member the edge previously flagged.
+func (cp *ControlPlane) ingestMemberLoss(r model.EdgeReport) {
+	if cp.Loss == nil {
+		return
+	}
+	samples := make([]lossmon.Sample, 0, len(r.Health.MemberLoss))
+	for _, ml := range r.Health.MemberLoss {
+		samples = append(samples, lossmon.Sample{
+			Member:  ml.Prefix,
+			Dir:     ml.Dir,
+			LossBps: ml.LossBps,
+			Reason:  ml.TopDropReason,
+		})
+	}
+	cp.Loss.Report(r.EdgeID, samples)
+}
+
+// RunLoss drives the §4.2.5 loss-policy sweep: each tick evaluates the per-member
+// sustain windows and fires alert transitions + per-pool migrates. Mirrors RunLiveness.
+func (cp *ControlPlane) RunLoss(ctx context.Context, interval time.Duration) {
+	cp.runLoop(ctx, interval, func(ctx context.Context) { cp.Loss.Tick(ctx) })
+}
+
+// emitForwardingDegraded is the loss monitor's ALERT callback: it ships the unsolicited
+// edge-forwarding-degraded (crossed the alert watermark) / edge-forwarding-recovered
+// (dropped back under it) event for one member. The loss monitor already tracks the
+// transition (fires only on a change), so this just emits. Async / Noop-safe.
+func (cp *ControlPlane) emitForwardingDegraded(edge model.EdgeID, member netip.Prefix, dir model.Direction, lossBps uint16, reason string, degraded bool) {
+	op := "edge-forwarding-recovered"
+	if degraded {
+		op = "edge-forwarding-degraded"
+	}
+	cp.emitter.Emit(context.Background(), apiresult.Event{
+		Op:           op,
+		Source:       "controller",
+		RequestID:    "",
+		Edge:         string(edge),
+		MemberPrefix: member.String(),
+		Reason:       fmt.Sprintf("%s %s", dir, reason),
+		LossBps:      lossBps,
+		TSUnixMs:     cp.now().UnixMilli(),
+	})
+}
+
+// migrateMemberPool is the loss monitor's MIGRATE callback: a member's loss stayed over
+// the migrate watermark for the sustain window, so move its POOL off the lossy home
+// (§4.2.5 — the affected pool only, NOT the whole edge; other members on this edge may
+// forward fine). Resolve member→pool, then gracefully promote the pool's backup (先发新
+// 后撤旧, the same planned-migrate primitive the admin API uses) and restore redundancy.
+// A pool with no backup cannot migrate — logged (the alert already flagged it for a
+// human); a member no longer homed on the reporting edge is a mid-migration race → skip.
+func (cp *ControlPlane) migrateMemberPool(ctx context.Context, edge model.EdgeID, member netip.Prefix, dir model.Direction, lossBps uint16) {
+	home, pool, ok, err := cp.memberHome(ctx, member)
+	if err != nil {
+		cp.log.Warn("loss-migrate: member→pool lookup failed", "edge", edge, "member", member, "err", err)
+		return
+	}
+	if !ok {
+		cp.log.Warn("loss-migrate: member has no claiming pool (stale loss report?)", "edge", edge, "member", member)
+		return
+	}
+	if home != edge {
+		// The pool no longer homes on the edge that reported the loss (already migrated,
+		// or a transient src→home skew). Idempotent skip — nothing to move.
+		cp.log.Info("loss-migrate: member not homed on reporting edge; skip", "edge", edge, "member", member, "home", home, "pool", pool)
+		return
+	}
+	_, newPrimary, oldPrimary, gen, err := cp.Orch.PromoteBackupGen(ctx, pool)
+	switch {
+	case errors.Is(err, orchestrator.ErrNoBackup):
+		cp.log.Warn("loss-migrate deferred: pool has no backup to promote onto", "edge", edge, "member", member, "pool", pool, "loss_bps", lossBps)
+		return
+	case errors.Is(err, orchestrator.ErrWithdrawIncomplete):
+		cp.log.Warn("loss-migrate: old-primary withdraw incomplete (new primary live)", "pool", pool, "err", err)
+	case err != nil:
+		cp.log.Warn("loss-migrate: promote failed", "edge", edge, "pool", pool, "err", err)
+		return
+	}
+	// Restore N+1 on a spare edge (best-effort; a missing spare is not a migrate failure).
+	if _, perr := cp.Orch.ProvisionBackup(ctx, pool); perr != nil {
+		cp.log.Warn("loss-migrate: backup not reprovisioned (redundancy not restored)", "pool", pool, "err", perr)
+	}
+	cp.log.Warn("per-member sustained loss → migrated pool off lossy home",
+		"edge", edge, "member", member, "dir", dir, "loss_bps", lossBps, "pool", pool, "from", oldPrimary, "to", newPrimary)
+	cp.emitForwardingMigrate(edge, member, pool, oldPrimary, newPrimary, lossBps, gen)
+}
+
+// emitForwardingMigrate ships the unsolicited migrate event for a loss-triggered
+// per-pool move (§4.2.5). Op "migrate" with Source="controller" + Reason="forwarding-
+// loss" distinguishes it from a request-correlated admin migrate; from_edge→to_edge +
+// member_prefix + loss_bps make it actionable. Async / Noop-safe.
+func (cp *ControlPlane) emitForwardingMigrate(edge model.EdgeID, member netip.Prefix, pool model.PoolID, from, to model.EdgeID, lossBps uint16, gen uint64) {
+	cp.emitter.Emit(context.Background(), apiresult.Event{
+		Op:           "migrate",
+		Source:       "controller",
+		RequestID:    "",
+		PoolID:       uint64(pool),
+		Edge:         string(to),
+		FromEdge:     string(from),
+		ToEdge:       string(to),
+		MemberPrefix: member.String(),
+		Reason:       "forwarding-loss",
+		LossBps:      lossBps,
+		Generation:   gen,
+		TSUnixMs:     cp.now().UnixMilli(),
 	})
 }
 
