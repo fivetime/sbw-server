@@ -555,6 +555,7 @@ func NewControlPlane(kv clientv3.KV, opt CPOptions) *ControlPlane {
 		// monotonicity for its BaseGeneration gap-detection; a seed jump across a
 		// restart/handoff triggers a full DESIRED_STATE resync (the safe backstop).
 		orchestrator.WithLiveness(func(e model.EdgeID) bool { return mon == nil || !mon.IsDead(e) }),
+		orchestrator.WithSessionBudget(cp.edgeSessionBudget), // §9.1 materialization admission
 		orchestrator.WithDoubleDeathAlarm(ddAlarm),
 		orchestrator.WithLogger(log),
 	)
@@ -1584,6 +1585,17 @@ func (cp *ControlPlane) emitFIBDrift(edge model.EdgeID, drift int) {
 		Gap:      gap,
 		TSUnixMs: cp.now().UnixMilli(),
 	})
+}
+
+// edgeSessionBudget is the §9.1 materialization admission input for placement: edge's
+// agent-reported max programmable members (CapacityReport.SessionBudget) from its latest
+// cached report, or 0 (unconstrained — no report yet, or a pre-§9.1 agent) so the session
+// dimension only bounds edges that advertise a limit. Wired via orchestrator.WithSessionBudget.
+func (cp *ControlPlane) edgeSessionBudget(e model.EdgeID) uint64 {
+	if r, ok := cp.reports.get(e); ok {
+		return r.Capacity.SessionBudget
+	}
+	return 0
 }
 
 // emitReportObservability turns one report's data-plane health COUNTERS into edge-

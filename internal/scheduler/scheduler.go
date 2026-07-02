@@ -28,6 +28,13 @@ import (
 // triggers rebalance).
 var ErrInsufficientCapacity = errors.New("scheduler: not enough agents with capacity")
 
+// ErrInsufficientSessions is returned when enough agents have BANDWIDTH room but too few
+// have MATERIALIZATION room (remaining classify sessions ≥ the pool's member count, §9.1).
+// Distinguished from ErrInsufficientCapacity so the caller emits a materialization-specific
+// reject event (capacity-exhausted reason=materialization) — the data plane physically
+// cannot program these members, a different operator signal than "sold out of bandwidth".
+var ErrInsufficientSessions = errors.New("scheduler: not enough agents with materialization budget")
+
 // Remaining reports an agent's remaining tokens. In production it is satisfied by
 // orchestrator.remaining = sellable(NIC×90%) − cached Yugabyte used (in-memory),
 // not the etcd ledger's Remaining.
@@ -43,11 +50,16 @@ var randomTieBreak = true
 // reproducibility. Production leaves the random spread. Not safe to toggle concurrently.
 func DisableRandomTieBreak() { randomTieBreak = false }
 
-// SelectHomes picks n distinct home agents from candidates, each with at least
-// need remaining tokens, preferring those with the most remaining (worst-fit /
-// spread). The result is ordered most-free-first, so [0] is the natural primary
-// and [1] the backup. Returns ErrInsufficientCapacity if fewer than n qualify.
-func SelectHomes(ctx context.Context, candidates []model.EdgeID, rem Remaining, need int64, n int) ([]model.EdgeID, error) {
+// SelectHomes picks n distinct home agents from candidates, each with at least `need`
+// remaining bandwidth tokens AND — when the session dimension is enabled — at least
+// `needSess` remaining materialization sessions (§9.1). Prefers most-bandwidth-remaining
+// (worst-fit / spread); result is ordered most-free-first, so [0] is the natural primary
+// and [1] the backup. The session dimension is enabled when remSess != nil and needSess > 0
+// (a pre-§9.1 agent reports SessionBudget 0 → the caller passes remSess=nil to select on
+// bandwidth alone, backward-compatible). Returns ErrInsufficientCapacity when too few
+// agents have bandwidth room, or ErrInsufficientSessions when bandwidth is fine but too
+// few have materialization room (so the caller can emit a materialization-specific event).
+func SelectHomes(ctx context.Context, candidates []model.EdgeID, rem Remaining, need int64, remSess Remaining, needSess int64, n int) ([]model.EdgeID, error) {
 	if n <= 0 {
 		return nil, nil
 	}
@@ -55,7 +67,9 @@ func SelectHomes(ctx context.Context, candidates []model.EdgeID, rem Remaining, 
 		edge model.EdgeID
 		free int64
 	}
+	sessOn := remSess != nil && needSess > 0
 	var qual []cand
+	bwOK := 0 // candidates passing the bandwidth constraint (regardless of sessions)
 	seen := make(map[model.EdgeID]struct{}, len(candidates))
 	for _, e := range candidates {
 		if _, dup := seen[e]; dup {
@@ -66,11 +80,27 @@ func SelectHomes(ctx context.Context, candidates []model.EdgeID, rem Remaining, 
 		if err != nil {
 			return nil, err
 		}
-		if free >= need {
-			qual = append(qual, cand{edge: e, free: free})
+		if free < need {
+			continue
 		}
+		bwOK++
+		if sessOn {
+			freeSess, err := remSess(ctx, e)
+			if err != nil {
+				return nil, err
+			}
+			if freeSess < needSess {
+				continue // bandwidth-viable but no materialization room
+			}
+		}
+		qual = append(qual, cand{edge: e, free: free})
 	}
 	if len(qual) < n {
+		// Distinguish the binding constraint: if enough agents had BANDWIDTH room, the
+		// shortfall is MATERIALIZATION (the data plane can't program these members).
+		if sessOn && bwOK >= n {
+			return nil, ErrInsufficientSessions
+		}
 		return nil, ErrInsufficientCapacity
 	}
 	// Worst-fit: most remaining first, RANDOM tie-break (not edge id). The orchestrator's

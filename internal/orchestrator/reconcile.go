@@ -274,18 +274,25 @@ func (o *Orchestrator) asyncProvisionBackup(ctx context.Context, raw ybstore.Piv
 	if err != nil {
 		return StatusActed, err
 	}
-	homes, err := scheduler.SelectHomes(ctx, candidates, o.remaining(capBps), rec.Tokens, 1)
+	remSess, needSess := o.sessionConstraint(len(rec.Pool.Members))
+	homes, err := scheduler.SelectHomes(ctx, candidates, o.remaining(capBps), rec.Tokens, remSess, needSess, 1)
 	if err != nil {
-		if errors.Is(err, scheduler.ErrInsufficientCapacity) {
+		// No spare on EITHER dimension (bandwidth ErrInsufficientCapacity OR §9.1
+		// materialization ErrInsufficientSessions) means this pool gets no backup.
+		if errors.Is(err, scheduler.ErrInsufficientCapacity) || errors.Is(err, scheduler.ErrInsufficientSessions) {
 			if !o.alive(rec.Primary) {
 				return o.asyncDoubleDeath(ctx, raw, rec) // primary dead + no spare = double death
 			}
 			// TIER-3: this pool can't get a backup (runs primary-only) AND the scheduler
 			// reported fleet-wide no-spare. Emit BOTH the per-pool redundancy-lost and the
-			// fleet-level capacity-exhausted (the control plane maps each to its event).
-			// Observability only — the StatusDegraded/ErrNoPlacement return is unchanged.
+			// fleet-level capacity-exhausted (the control plane maps each to its event); the
+			// reason distinguishes bandwidth from materialization exhaustion (§9.1).
+			reason := "no-capacity"
+			if errors.Is(err, scheduler.ErrInsufficientSessions) {
+				reason = "no-materialization-budget"
+			}
 			o.notifyRedundancy("redundancy-lost", rec.PoolID, "", "no-spare-capacity")
-			o.notifyRedundancy("capacity-exhausted", rec.PoolID, "", "no-capacity")
+			o.notifyRedundancy("capacity-exhausted", rec.PoolID, "", reason)
 			return StatusDegraded, ErrNoPlacement
 		}
 		return StatusActed, err

@@ -39,6 +39,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math"
 	"net/netip"
 	"strconv"
 	"sync"
@@ -121,6 +122,7 @@ type Orchestrator struct {
 	homeMarker func(model.EdgeID) (model.LargeCommunity, bool)
 	suppress   func(model.EdgeID, netip.Prefix) bool // T-607 advertise gate; nil = advertise all
 	isAlive    func(model.EdgeID) bool               // liveness oracle; nil = treat all alive
+	sessBudget func(model.EdgeID) uint64             // §9.1 materialization budget (agent-reported); nil = session dim off
 	onDblDeath func(id model.PoolID, failOpen bool)  // C-04 double-death alarm; nil = silent
 	// onFailover, if set, is invoked at an AUTONOMOUS (node-failure-driven) auto-promote
 	// decision point — the async reconciler's PROMOTE step and the synchronous
@@ -231,6 +233,16 @@ func WithGenerator(seed func() uint64) Option {
 // WithLiveness wires a liveness oracle (the liveness monitor's IsDead, negated):
 // placement avoids dead agents, and drain tells a live backup (promotable) from
 // a dead one (double death). nil treats every registered agent as alive.
+// WithSessionBudget wires the §9.1 materialization admission dimension: sessBudget(edge)
+// is the max members that edge can program (agent-reported CapacityReport.SessionBudget).
+// When set, placement rejects a pool whose members would exceed an edge's remaining
+// session budget (ErrNoPlacement / capacity-exhausted materialization), instead of
+// silently homing intent the data plane cannot materialize. nil (or a budget of 0 per
+// edge) leaves placement on bandwidth alone.
+func WithSessionBudget(f func(model.EdgeID) uint64) Option {
+	return func(o *Orchestrator) { o.sessBudget = f }
+}
+
 func WithLiveness(isAlive func(model.EdgeID) bool) Option {
 	return func(o *Orchestrator) { o.isAlive = isAlive }
 }
@@ -497,10 +509,44 @@ func (o *Orchestrator) liveCandidatesCap(ctx context.Context, exclude map[model.
 	return out, capBps, nil
 }
 
-// CapacityProvider supplies each edge's committed used-capacity for optimistic
-// placement. *ybstore.CapacityCache satisfies it (a periodically-refreshed snapshot of
-// Yugabyte's UsedByEdge); the unit tests inject a trivial in-memory provider.
-type CapacityProvider interface{ Used(model.EdgeID) int64 }
+// CapacityProvider supplies each edge's committed usage for optimistic placement:
+// Used = Σ sold bandwidth (bps token cost), Members = Σ materialized member COUNT (the
+// §9.1 session dimension). *ybstore.CapacityCache satisfies it (a periodically-refreshed
+// snapshot of Yugabyte's UsedByEdge/MembersByEdge); the unit tests inject a trivial
+// in-memory provider.
+type CapacityProvider interface {
+	Used(model.EdgeID) int64
+	Members(model.EdgeID) int64
+}
+
+// sessRemaining is the per-edge MATERIALIZATION-budget closure the SelectHomes session
+// dimension uses (§9.1): reported SessionBudget(edge) − cached materialized Members(edge).
+// An edge that reports NO budget (pre-§9.1 agent, sessBudget 0) is UNCONSTRAINED
+// (math.MaxInt64 free) so a mixed fleet still places — only edges that advertise a limit
+// are bounded by it. Returns nil when the session dimension is not wired at all.
+func (o *Orchestrator) sessRemaining() scheduler.Remaining {
+	if o.sessBudget == nil {
+		return nil
+	}
+	return func(_ context.Context, e model.EdgeID) (int64, error) {
+		budget := o.sessBudget(e)
+		if budget == 0 {
+			return math.MaxInt64, nil // unreported → unconstrained
+		}
+		return int64(budget) - o.cap.Members(e), nil
+	}
+}
+
+// sessionConstraint returns the (remSess, needSess) pair to pass to SelectHomes for a pool
+// with memberCount members: the materialization closure + the member count when the session
+// dimension is wired, or (nil, 0) to select on bandwidth alone.
+func (o *Orchestrator) sessionConstraint(memberCount int) (scheduler.Remaining, int64) {
+	rs := o.sessRemaining()
+	if rs == nil {
+		return nil, 0
+	}
+	return rs, int64(memberCount)
+}
 
 // remaining returns the optimistic per-edge token-budget closure SelectHomes uses on
 // EVERY placement path (create + reconcile-driven backup provision): remaining =
@@ -600,9 +646,13 @@ func (o *Orchestrator) CreatePoolNonceGen(ctx context.Context, pool model.Pool, 
 	// (used+tokens ≤ sellable), rejecting the create on violation. That keeps the create
 	// to ONE (Yugabyte) write while restoring a hard gate. Not built now: the lab
 	// over-provisions capacity, so optimistic placement never oversells.
-	homes, err := scheduler.SelectHomes(ctx, candidates, o.remaining(capBps), tokens, o.replicas)
+	remSess, needSess := o.sessionConstraint(len(pool.Members))
+	homes, err := scheduler.SelectHomes(ctx, candidates, o.remaining(capBps), tokens, remSess, needSess, o.replicas)
 	if err != nil {
-		if errors.Is(err, scheduler.ErrInsufficientCapacity) {
+		// Both "out of bandwidth" and "out of materialization budget" (§9.1) mean the pool
+		// cannot be placed → 503 (ErrNoPlacement). Preserve the sentinel in the wrap so the
+		// requester's 503 body / logs distinguish materialization from bandwidth exhaustion.
+		if errors.Is(err, scheduler.ErrInsufficientCapacity) || errors.Is(err, scheduler.ErrInsufficientSessions) {
 			return poolstore.Record{}, "", 0, fmt.Errorf("%w: %v", ErrNoPlacement, err)
 		}
 		return poolstore.Record{}, "", 0, err

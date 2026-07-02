@@ -150,6 +150,21 @@ func (f *fakeYB) Used(edge model.EdgeID) int64 {
 	return used
 }
 
+// Members reports an edge's materialized member COUNT — Σ over the pools it is PRIMARY
+// (home) for of their member count — the §9.1 session-dimension "used" driven off the same
+// authoritative pool set as Used.
+func (f *fakeYB) Members(edge model.EdgeID) int64 {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var n int64
+	for _, r := range f.pools {
+		if r.Primary == edge {
+			n += int64(len(r.Pool.Members))
+		}
+	}
+	return n
+}
+
 func (f *fakeYB) Get(ctx context.Context, id model.PoolID) (ybstore.Record, bool, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()

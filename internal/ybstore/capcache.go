@@ -24,8 +24,9 @@ type CapacityCache struct {
 	interval time.Duration
 	log      *slog.Logger
 
-	mu   sync.RWMutex
-	used map[model.EdgeID]int64
+	mu      sync.RWMutex
+	used    map[model.EdgeID]int64 // bandwidth: Σ cost per home_edge (UsedByEdge)
+	members map[model.EdgeID]int64 // materialization: member COUNT per home_edge (§9.1)
 }
 
 // NewCapacityCache builds a cache over store, refreshing every interval (0 → 5s).
@@ -35,7 +36,8 @@ func NewCapacityCache(store *Store, interval time.Duration) *CapacityCache {
 	if interval <= 0 {
 		interval = 5 * time.Second
 	}
-	return &CapacityCache{store: store, interval: interval, log: slog.Default(), used: map[model.EdgeID]int64{}}
+	return &CapacityCache{store: store, interval: interval, log: slog.Default(),
+		used: map[model.EdgeID]int64{}, members: map[model.EdgeID]int64{}}
 }
 
 // WithLogger sets the logger used to surface refresh failures (stale-capacity
@@ -55,8 +57,13 @@ func (c *CapacityCache) Refresh(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	members, err := c.store.MembersByEdge(ctx)
+	if err != nil {
+		return err
+	}
 	c.mu.Lock()
 	c.used = used
+	c.members = members
 	c.mu.Unlock()
 	return nil
 }
@@ -67,6 +74,14 @@ func (c *CapacityCache) Used(edge model.EdgeID) int64 {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	return c.used[edge]
+}
+
+// Members returns the cached materialized member count for edge (0 if unknown) — the
+// §9.1 session-dimension "used" that placement bounds against the reported SessionBudget.
+func (c *CapacityCache) Members(edge model.EdgeID) int64 {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.members[edge]
 }
 
 // Run refreshes the cache every interval until ctx is cancelled. Blocks; run in a

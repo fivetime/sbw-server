@@ -15,7 +15,7 @@ func remFn(m map[model.EdgeID]int64) Remaining {
 func TestSelectHomesDistinctWithCapacity(t *testing.T) {
 	cands := []model.EdgeID{"e2", "e5", "e9"}
 	got, err := SelectHomes(context.Background(), cands,
-		remFn(map[model.EdgeID]int64{"e2": 500, "e5": 800, "e9": 300}), 400, 2)
+		remFn(map[model.EdgeID]int64{"e2": 500, "e5": 800, "e9": 300}), 400, nil, 0, 2)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -31,7 +31,7 @@ func TestSelectHomesDistinctWithCapacity(t *testing.T) {
 func TestSelectHomesInsufficient(t *testing.T) {
 	// Only one agent has >= need → can't place a primary+backup pair.
 	_, err := SelectHomes(context.Background(), []model.EdgeID{"e2", "e5"},
-		remFn(map[model.EdgeID]int64{"e2": 1000, "e5": 100}), 500, 2)
+		remFn(map[model.EdgeID]int64{"e2": 1000, "e5": 100}), 500, nil, 0, 2)
 	if !errors.Is(err, ErrInsufficientCapacity) {
 		t.Errorf("want ErrInsufficientCapacity, got %v", err)
 	}
@@ -39,7 +39,7 @@ func TestSelectHomesInsufficient(t *testing.T) {
 
 func TestSelectHomesDedupCandidates(t *testing.T) {
 	got, err := SelectHomes(context.Background(), []model.EdgeID{"e2", "e2", "e5"},
-		remFn(map[model.EdgeID]int64{"e2": 900, "e5": 600}), 100, 2)
+		remFn(map[model.EdgeID]int64{"e2": 900, "e5": 600}), 100, nil, 0, 2)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -55,7 +55,7 @@ func TestSelectHomesTieBreakSpreads(t *testing.T) {
 	primary := map[model.EdgeID]int{}
 	for i := 0; i < calls; i++ {
 		got, err := SelectHomes(context.Background(), []model.EdgeID{"e9", "e2", "e5"},
-			remFn(map[model.EdgeID]int64{"e2": 500, "e5": 500, "e9": 500}), 100, 2)
+			remFn(map[model.EdgeID]int64{"e2": 500, "e5": 500, "e9": 500}), 100, nil, 0, 2)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -76,8 +76,36 @@ func TestSelectHomesTieBreakSpreads(t *testing.T) {
 func TestSelectHomesErrorPropagates(t *testing.T) {
 	boom := errors.New("etcd down")
 	_, err := SelectHomes(context.Background(), []model.EdgeID{"e2"},
-		func(_ context.Context, _ model.EdgeID) (int64, error) { return 0, boom }, 1, 1)
+		func(_ context.Context, _ model.EdgeID) (int64, error) { return 0, boom }, 1, nil, 0, 1)
 	if !errors.Is(err, boom) {
 		t.Errorf("rem error must propagate, got %v", err)
+	}
+}
+
+// TestSelectHomesSessionDimension: with the materialization dimension enabled, an edge
+// with bandwidth room but NO session room is rejected, and when bandwidth is fine but too
+// few edges have session room the error is ErrInsufficientSessions (not …Capacity), so the
+// caller can emit a materialization-specific event (§9.1).
+func TestSelectHomesSessionDimension(t *testing.T) {
+	cands := []model.EdgeID{"e2", "e5", "e9"}
+	bw := remFn(map[model.EdgeID]int64{"e2": 1000, "e5": 1000, "e9": 1000}) // all have bandwidth
+	// e2 full on sessions (0 free), e5/e9 have room.
+	sess := remFn(map[model.EdgeID]int64{"e2": 0, "e5": 500, "e9": 500})
+
+	got, err := SelectHomes(context.Background(), cands, bw, 100, sess, 50, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range got {
+		if e == "e2" {
+			t.Errorf("e2 has no session room; must not be selected: %v", got)
+		}
+	}
+
+	// Only e5 has session room for a big pool → can't place a distinct pair → session-bound.
+	sess2 := remFn(map[model.EdgeID]int64{"e2": 10, "e5": 500, "e9": 10})
+	_, err = SelectHomes(context.Background(), cands, bw, 100, sess2, 100, 2)
+	if !errors.Is(err, ErrInsufficientSessions) {
+		t.Errorf("want ErrInsufficientSessions (bandwidth fine, sessions short), got %v", err)
 	}
 }

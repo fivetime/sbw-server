@@ -949,6 +949,36 @@ func (s *Store) UsedByEdge(ctx context.Context) (map[model.EdgeID]int64, error) 
 	})
 }
 
+// MembersByEdge returns each edge's MATERIALIZED member count — the number of members
+// homed to it (home_edge), the materialization "used" the §9.1 admission layer bounds
+// against the agent-reported SessionBudget (max classify sessions before VPP os_panics).
+// One grouped aggregate mirroring UsedByEdge (bandwidth), so the placement cache refreshes
+// the whole map in a single follower read.
+func (s *Store) MembersByEdge(ctx context.Context) (map[model.EdgeID]int64, error) {
+	return followerRead(ctx, s, "members-by-edge", func(tx pgx.Tx) (map[model.EdgeID]int64, error) {
+		rows, err := tx.Query(ctx,
+			`SELECT home_edge, COUNT(*) FROM members GROUP BY home_edge`)
+		if err != nil {
+			return nil, fmt.Errorf("ybstore: members-by-edge: %w", err)
+		}
+		defer rows.Close()
+
+		out := make(map[model.EdgeID]int64)
+		for rows.Next() {
+			var edge string
+			var n int64
+			if err := rows.Scan(&edge, &n); err != nil {
+				return nil, fmt.Errorf("ybstore: scan members-by-edge: %w", err)
+			}
+			out[model.EdgeID(edge)] = n
+		}
+		if err := rows.Err(); err != nil {
+			return nil, fmt.Errorf("ybstore: members-by-edge rows: %w", err)
+		}
+		return out, nil
+	})
+}
+
 // nullEdge maps an empty backup edge to a NULL backup_edge (so the
 // pools_by_backup index never indexes a placeholder ""), else the string.
 func nullEdge(e model.EdgeID) any {
