@@ -36,8 +36,10 @@ func NewCapacityCache(store *Store, interval time.Duration) *CapacityCache {
 	if interval <= 0 {
 		interval = 5 * time.Second
 	}
-	return &CapacityCache{store: store, interval: interval, log: slog.Default(),
-		used: map[model.EdgeID]int64{}, members: map[model.EdgeID]int64{}}
+	return &CapacityCache{
+		store: store, interval: interval, log: slog.Default(),
+		used: map[model.EdgeID]int64{}, members: map[model.EdgeID]int64{},
+	}
 }
 
 // WithLogger sets the logger used to surface refresh failures (stale-capacity
