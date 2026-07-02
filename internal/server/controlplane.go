@@ -165,6 +165,7 @@ type ControlPlane struct {
 	obsMu             sync.Mutex
 	dpDownEdges       map[model.EdgeID]bool // edge → last-emitted data-plane-down level
 	meteringStaleEdge map[model.EdgeID]bool // edge → last-emitted metering-stale level
+	fibDriftEdges     map[model.EdgeID]bool // edge → last-emitted FIB route-count-drift level (§6.5)
 	// deathMethodByEdge carries the most recent DEATH METHOD ("hard-quorum"|"heartbeat-
 	// stale"|"soft-death") the liveness monitor reported for an edge, set by the death
 	// notify (which also emits the one edge-down event) and read by emitFailover so the
@@ -384,6 +385,7 @@ func NewControlPlane(kv clientv3.KV, opt CPOptions) *ControlPlane {
 		pending:              make(map[string]pendingResult),
 		dpDownEdges:          make(map[model.EdgeID]bool),
 		meteringStaleEdge:    make(map[model.EdgeID]bool),
+		fibDriftEdges:        make(map[model.EdgeID]bool),
 		deathMethodByEdge:    make(map[model.EdgeID]string),
 		metrics:              opt.Metrics,
 		log:                  log,
@@ -474,6 +476,22 @@ func NewControlPlane(kv clientv3.KV, opt CPOptions) *ControlPlane {
 		// to BGP). Convert the per-report LEVEL into an EDGE — emit only on up→down /
 		// down→up, not every report. Async / Noop-safe.
 		cp.emitEdgeDataplane(r.EdgeID, r.Health.State == model.HealthDataPlaneDown)
+		// FIB-DRIFT (DESIGN §6.5): the agent reports Health.FIBDrift (BIRD↔VPP route-count
+		// mirror departure — a soft death BGP can't see). It only reaches HealthDegraded so
+		// it drives no failover; surface it to BSS as an edge-triggered fib-drift / cleared
+		// event (was previously received-and-dropped).
+		cp.emitFIBDrift(r.EdgeID, r.Health.FIBDrift)
+		// DELIVERY-DEGRADED (DESIGN §9.1): the agent reports its CUMULATIVE dropped-delta
+		// count. A RISE since its last report means it is shedding pushed desired-state
+		// updates under local back-pressure (deltaQ overflow) — the resync backstop
+		// re-delivers, but BSS should know the edge is saturated (the control plane can't
+		// push as fast as this agent materializes). A TRUE positive (the agent COUNTED the
+		// drop), so — unlike ReconcileProgram's inferred delivery-loss, which is gated by
+		// debounce/phase/freshness to avoid false positives during churn — it is emitted on
+		// every rise. A DECREASE = agent restart (counter reset), not a drop → ignored.
+		if prev, ok := reports.get(r.EdgeID); ok && r.Health.DeltasDropped > prev.Health.DeltasDropped {
+			cp.emitDeliveryDegraded(r.EdgeID, r.Health.DeltasDropped-prev.Health.DeltasDropped)
+		}
 		reports.put(r) // cache for account reconciliation (§4.3)
 		// API-RESULT CONVERGENCE: the report echoes the applied desired-state generation
 		// (r.Generation). Resolve any pending create/update/destroy whose home is this
@@ -1410,6 +1428,24 @@ func (cp *ControlPlane) emitProgramDrift(d ProgramDrift) {
 	})
 }
 
+// emitDeliveryDegraded ships the DESIGN §9.1 "delivery-degraded" event: the agent
+// dropped `delta` more desired-state deltas under local back-pressure (deltaQ overflow)
+// since its last report. Unlike emitProgramDrift's delivery-loss (INFERRED from a
+// count mismatch and gated by debounce/phase/freshness to suppress false positives
+// during churn), this is a TRUE positive — the agent COUNTED the drop — so it fires
+// unconditionally on every rise. The resync backstop still re-delivers the dropped
+// state; this just makes the saturation visible to BSS. Async / Noop-safe.
+func (cp *ControlPlane) emitDeliveryDegraded(edge model.EdgeID, delta uint64) {
+	cp.emitter.Emit(context.Background(), apiresult.Event{
+		Op:       "delivery-degraded",
+		Source:   "controller",
+		Edge:     string(edge),
+		Reason:   "delta-queue-overflow",
+		Gap:      int(delta),
+		TSUnixMs: cp.now().UnixMilli(),
+	})
+}
+
 // emitAnchorMismatch ships TIER-1 per-member apply-failure events at the L-04 alarm
 // point (ReconcileAnchors): one "anchor-unprovisioned" per Unprovisioned[] prefix (the
 // member is assigned here but its /32 is not advertised → no data path) and one
@@ -1522,6 +1558,43 @@ func (cp *ControlPlane) emitEdgeDataplane(edge model.EdgeID, dpDown bool) {
 		Edge:      string(edge),
 		Reason:    reason,
 		TSUnixMs:  cp.now().UnixMilli(),
+	})
+}
+
+// emitFIBDrift is the LEVEL→EDGE converter for the FIB route-count drift the agent
+// reports in Health.FIBDrift: the BIRD↔VPP mirror's departure from its calibrated
+// baseline — a transit route lost BEFORE the FIB (or a stale FIB) that BGP/canary
+// cannot see (a data-plane soft-death symptom, DESIGN §6.5). It only reaches
+// HealthDegraded (not HealthDataPlaneDown), so it drives NO failover and, until now,
+// no BSS event at all — the agent counted it but the server dropped it. `drift` is the
+// CURRENT level (non-zero = drifted); this emits exactly one "fib-drift"
+// (baseline→drifted, Gap = magnitude) or "fib-drift-cleared" (drifted→baseline) on a
+// CHANGE, keyed per edge — NOT every report. Absent/false key = baseline default, so
+// the first non-zero report transitions. Async / Noop-safe.
+func (cp *ControlPlane) emitFIBDrift(edge model.EdgeID, drift int) {
+	drifted := drift != 0
+	cp.obsMu.Lock()
+	if cp.fibDriftEdges[edge] == drifted {
+		cp.obsMu.Unlock()
+		return // no transition
+	}
+	cp.fibDriftEdges[edge] = drifted
+	cp.obsMu.Unlock()
+
+	op, reason, gap := "fib-drift-cleared", "fib-baseline-restored", 0
+	if drifted {
+		op, reason, gap = "fib-drift", "bird-vpp-fib-mismatch", drift
+		if gap < 0 {
+			gap = -gap // report the magnitude (drift can be signed: FIB short vs long)
+		}
+	}
+	cp.emitter.Emit(context.Background(), apiresult.Event{
+		Op:       op,
+		Source:   "controller",
+		Edge:     string(edge),
+		Reason:   reason,
+		Gap:      gap,
+		TSUnixMs: cp.now().UnixMilli(),
 	})
 }
 

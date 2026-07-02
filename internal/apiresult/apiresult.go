@@ -67,7 +67,7 @@ const (
 //     (no converged/timeout handshake) — Outcome/FromEdge/ToEdge are left empty.
 type Event struct {
 	RequestID  string  `json:"request_id"`
-	Op         string  `json:"op"` // open set: "create"|"update"|"destroy"|"migrate"|"decommission"|"failover"|"member-down"|"member-up"|"delivery-loss"|"program-drift"|"anchor-unprovisioned"|"anchor-rogue"|"edge-dataplane-down"|"edge-dataplane-up"|"metering-stale"|"metering-resumed"|"pool-double-death"|"pool-expired"|"member-evicted"|"edge-down"|"edge-up"|"edge-registered"|"edge-deregistered"|"edge-capacity-changed"|"redundancy-lost"|"redundancy-regained"|"backup-changed"|"capacity-exhausted"|"rehome"|…
+	Op         string  `json:"op"` // open set: "create"|"update"|"destroy"|"migrate"|"decommission"|"failover"|"member-down"|"member-up"|"delivery-loss"|"delivery-degraded"|"program-drift"|"fib-drift"|"fib-drift-cleared"|"anchor-unprovisioned"|"anchor-rogue"|"edge-dataplane-down"|"edge-dataplane-up"|"metering-stale"|"metering-resumed"|"pool-double-death"|"pool-expired"|"member-evicted"|"edge-down"|"edge-up"|"edge-registered"|"edge-deregistered"|"edge-capacity-changed"|"redundancy-lost"|"redundancy-regained"|"backup-changed"|"capacity-exhausted"|"rehome"|…
 	PoolID     uint64  `json:"pool_id"`
 	Edge       string  `json:"edge,omitempty"`    // the primary/home edge whose apply resolves an API-result op (member-down/up: the member's home edge)
 	Outcome    Outcome `json:"outcome,omitempty"` // "converged"|"failed" (API-result only; empty for failover / member-down/up)
