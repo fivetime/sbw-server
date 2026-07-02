@@ -233,6 +233,10 @@ func WithGenerator(seed func() uint64) Option {
 // WithLiveness wires a liveness oracle (the liveness monitor's IsDead, negated):
 // placement avoids dead agents, and drain tells a live backup (promotable) from
 // a dead one (double death). nil treats every registered agent as alive.
+func WithLiveness(isAlive func(model.EdgeID) bool) Option {
+	return func(o *Orchestrator) { o.isAlive = isAlive }
+}
+
 // WithSessionBudget wires the §9.1 materialization admission dimension: sessBudget(edge)
 // is the max members that edge can program (agent-reported CapacityReport.SessionBudget).
 // When set, placement rejects a pool whose members would exceed an edge's remaining
@@ -241,10 +245,6 @@ func WithGenerator(seed func() uint64) Option {
 // edge) leaves placement on bandwidth alone.
 func WithSessionBudget(f func(model.EdgeID) uint64) Option {
 	return func(o *Orchestrator) { o.sessBudget = f }
-}
-
-func WithLiveness(isAlive func(model.EdgeID) bool) Option {
-	return func(o *Orchestrator) { o.isAlive = isAlive }
 }
 
 // WithDoubleDeathAlarm sets the callback fired when a pool loses ALL live homes
