@@ -476,22 +476,10 @@ func NewControlPlane(kv clientv3.KV, opt CPOptions) *ControlPlane {
 		// to BGP). Convert the per-report LEVEL into an EDGE — emit only on up→down /
 		// down→up, not every report. Async / Noop-safe.
 		cp.emitEdgeDataplane(r.EdgeID, r.Health.State == model.HealthDataPlaneDown)
-		// FIB-DRIFT (DESIGN §6.5): the agent reports Health.FIBDrift (BIRD↔VPP route-count
-		// mirror departure — a soft death BGP can't see). It only reaches HealthDegraded so
-		// it drives no failover; surface it to BSS as an edge-triggered fib-drift / cleared
-		// event (was previously received-and-dropped).
-		cp.emitFIBDrift(r.EdgeID, r.Health.FIBDrift)
-		// DELIVERY-DEGRADED (DESIGN §9.1): the agent reports its CUMULATIVE dropped-delta
-		// count. A RISE since its last report means it is shedding pushed desired-state
-		// updates under local back-pressure (deltaQ overflow) — the resync backstop
-		// re-delivers, but BSS should know the edge is saturated (the control plane can't
-		// push as fast as this agent materializes). A TRUE positive (the agent COUNTED the
-		// drop), so — unlike ReconcileProgram's inferred delivery-loss, which is gated by
-		// debounce/phase/freshness to avoid false positives during churn — it is emitted on
-		// every rise. A DECREASE = agent restart (counter reset), not a drop → ignored.
-		if prev, ok := reports.get(r.EdgeID); ok && r.Health.DeltasDropped > prev.Health.DeltasDropped {
-			cp.emitDeliveryDegraded(r.EdgeID, r.Health.DeltasDropped-prev.Health.DeltasDropped)
-		}
+		// Turn the report's data-plane health COUNTERS (FIBDrift level + cumulative
+		// dropped-delta count) into edge-triggered BSS events (§6.5/§9.1). Call BEFORE
+		// reports.put — it reads the prior cached report to detect a drop-count rise.
+		cp.emitReportObservability(r)
 		reports.put(r) // cache for account reconciliation (§4.3)
 		// API-RESULT CONVERGENCE: the report echoes the applied desired-state generation
 		// (r.Generation). Resolve any pending create/update/destroy whose home is this
@@ -1596,6 +1584,19 @@ func (cp *ControlPlane) emitFIBDrift(edge model.EdgeID, drift int) {
 		Gap:      gap,
 		TSUnixMs: cp.now().UnixMilli(),
 	})
+}
+
+// emitReportObservability turns one report's data-plane health COUNTERS into edge-
+// triggered BSS events: fib-drift on the FIBDrift level (§6.5), and delivery-degraded
+// when the agent's CUMULATIVE dropped-delta count rises since its last cached report
+// (§9.1 — a true positive: the agent counted the drop, so it is NOT gated like
+// ReconcileProgram's inferred delivery-loss; a DECREASE = agent restart, ignored). Call
+// BEFORE reports.put so the prior cached report is still the comparison base.
+func (cp *ControlPlane) emitReportObservability(r model.EdgeReport) {
+	cp.emitFIBDrift(r.EdgeID, r.Health.FIBDrift)
+	if prev, ok := cp.reports.get(r.EdgeID); ok && r.Health.DeltasDropped > prev.Health.DeltasDropped {
+		cp.emitDeliveryDegraded(r.EdgeID, r.Health.DeltasDropped-prev.Health.DeltasDropped)
+	}
 }
 
 // emitMeteringStale is the LEVEL→EDGE converter for the TIER-1 metering-stale
