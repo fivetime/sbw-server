@@ -451,79 +451,76 @@ func (s *Store) PoolsForBackup(ctx context.Context, edge model.EdgeID) ([]model.
 // instead of one level-triggered ReconcilePool per pool (per-pool UpdateCAS + a
 // per-pool bump on the SAME new-primary key → CAS-conflict storm). One query.
 func (s *Store) ListPivotsByPrimary(ctx context.Context, edge model.EdgeID) ([]PivotRow, error) {
-	return readRetry(s, "list-pivots-by-primary", func() ([]PivotRow, error) { return s.listPivotsByPrimaryOnce(ctx, edge) })
+	return followerRead(ctx, s, "list-pivots-by-primary", func(tx pgx.Tx) ([]PivotRow, error) {
+		rows, err := tx.Query(ctx,
+			`SELECT id, body, home_edge, backup_edge, cost, version FROM pools WHERE home_edge = $1`,
+			string(edge))
+		if err != nil {
+			return nil, fmt.Errorf("ybstore: list-pivots-by-primary %s: %w", edge, err)
+		}
+		defer rows.Close()
+		var out []PivotRow
+		for rows.Next() {
+			var (
+				id      int64
+				body    []byte
+				home    string
+				backup  *string
+				cost    int64
+				version int64
+			)
+			if err := rows.Scan(&id, &body, &home, &backup, &cost, &version); err != nil {
+				return nil, fmt.Errorf("ybstore: scan pivot: %w", err)
+			}
+			var rec Record
+			if err := json.Unmarshal(body, &rec); err != nil {
+				s.log.Error("ybstore: skipping malformed pivot row", "pool", id, "err", err)
+				continue
+			}
+			row := PivotRow{Pool: rec.Pool, PoolID: model.PoolID(id), Primary: model.EdgeID(home), Tokens: cost, Version: version}
+			if backup != nil {
+				row.Backup = model.EdgeID(*backup)
+			}
+			out = append(out, row)
+		}
+		return out, rows.Err()
+	})
 }
 
-func (s *Store) listPivotsByPrimaryOnce(ctx context.Context, edge model.EdgeID) ([]PivotRow, error) {
-	rows, err := s.pool.Query(ctx,
-		`SELECT id, body, home_edge, backup_edge, cost, version FROM pools WHERE home_edge = $1`,
-		string(edge))
-	if err != nil {
-		return nil, fmt.Errorf("ybstore: list-pivots-by-primary %s: %w", edge, err)
-	}
-	defer rows.Close()
-	var out []PivotRow
-	for rows.Next() {
-		var (
-			id      int64
-			body    []byte
-			home    string
-			backup  *string
-			cost    int64
-			version int64
-		)
-		if err := rows.Scan(&id, &body, &home, &backup, &cost, &version); err != nil {
-			return nil, fmt.Errorf("ybstore: scan pivot: %w", err)
-		}
-		var rec Record
-		if err := json.Unmarshal(body, &rec); err != nil {
-			s.log.Error("ybstore: skipping malformed pivot row", "pool", id, "err", err)
-			continue
-		}
-		row := PivotRow{Pool: rec.Pool, PoolID: model.PoolID(id), Primary: model.EdgeID(home), Tokens: cost, Version: version}
-		if backup != nil {
-			row.Backup = model.EdgeID(*backup)
-		}
-		out = append(out, row)
-	}
-	return out, rows.Err()
-}
-
-// poolsBy runs SELECT body FROM pools WHERE <col>=$1 and unmarshals each row's
-// stored Record body to its model.Pool. col is a fixed identifier (home_edge /
-// backup_edge), never user input.
+// poolsBy runs SELECT body FROM pools WHERE <col>=$1 and unmarshals each row's stored
+// Record body to its model.Pool. col is a fixed identifier (home_edge / backup_edge),
+// never user input. Runs as a follower read: at 5.9M members this per-edge scan tripped
+// read-restart on every retry and starved the render (DESIGN §9.1).
 func (s *Store) poolsBy(ctx context.Context, col string, edge model.EdgeID) ([]model.Pool, error) {
-	return readRetry(s, "pools by "+col, func() ([]model.Pool, error) { return s.poolsByOnce(ctx, col, edge) })
-}
-
-func (s *Store) poolsByOnce(ctx context.Context, col string, edge model.EdgeID) ([]model.Pool, error) {
-	rows, err := s.pool.Query(ctx, `SELECT id, body FROM pools WHERE `+col+` = $1`, string(edge))
-	if err != nil {
-		return nil, fmt.Errorf("ybstore: pools by %s=%s: %w", col, edge, err)
-	}
-	defer rows.Close()
-
-	var out []model.Pool
-	for rows.Next() {
-		var id int64
-		var body []byte
-		if err := rows.Scan(&id, &body); err != nil {
-			return nil, fmt.Errorf("ybstore: scan pool body: %w", err)
+	return followerRead(ctx, s, "pools by "+col, func(tx pgx.Tx) ([]model.Pool, error) {
+		rows, err := tx.Query(ctx, `SELECT id, body FROM pools WHERE `+col+` = $1`, string(edge))
+		if err != nil {
+			return nil, fmt.Errorf("ybstore: pools by %s=%s: %w", col, edge, err)
 		}
-		var rec Record
-		if err := json.Unmarshal(body, &rec); err != nil {
-			// A dropped pool is a blind spot (it silently vanishes from the render);
-			// log LOUD with the pool id before skipping rather than fail the whole render.
-			s.log.Error("ybstore: skipping malformed pool row", "pool", id, "by", col, "err", err)
-			continue
+		defer rows.Close()
+
+		var out []model.Pool
+		for rows.Next() {
+			var id int64
+			var body []byte
+			if err := rows.Scan(&id, &body); err != nil {
+				return nil, fmt.Errorf("ybstore: scan pool body: %w", err)
+			}
+			var rec Record
+			if err := json.Unmarshal(body, &rec); err != nil {
+				// A dropped pool is a blind spot (it silently vanishes from the render);
+				// log LOUD with the pool id before skipping rather than fail the whole render.
+				s.log.Error("ybstore: skipping malformed pool row", "pool", id, "by", col, "err", err)
+				continue
+			}
+			out = append(out, rec.Pool)
 		}
-		out = append(out, rec.Pool)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("ybstore: pools by %s rows: %w", col, err)
-	}
-	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
-	return out, nil
+		if err := rows.Err(); err != nil {
+			return nil, fmt.Errorf("ybstore: pools by %s rows: %w", col, err)
+		}
+		sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
+		return out, nil
+	})
 }
 
 // Get returns a pool's Record; ok=false if no such pool. Keeps the (rec, ok, err)
@@ -690,22 +687,28 @@ func (s *Store) DeleteCAS(ctx context.Context, id model.PoolID, expectVersion in
 // `edge` — the pools to enqueue for the level-triggered reconciler when that edge
 // dies/decommissions. Served by the pools_by_home / pools_by_backup indexes.
 func (s *Store) PoolsForDeadEdge(ctx context.Context, edge model.EdgeID) ([]model.PoolID, error) {
-	rows, err := s.pool.Query(ctx,
-		`SELECT id FROM pools WHERE home_edge=$1 OR backup_edge=$1`, string(edge))
-	if err != nil {
-		return nil, fmt.Errorf("ybstore: pools-for-dead-edge %s: %w", edge, err)
-	}
-	defer rows.Close()
-	var out []model.PoolID
-	for rows.Next() {
-		var id int64
-		if err := rows.Scan(&id); err != nil {
-			return nil, fmt.Errorf("ybstore: scan dead-edge id: %w", err)
+	out, err := followerRead(ctx, s, "pools-for-dead-edge", func(tx pgx.Tx) ([]model.PoolID, error) {
+		rows, err := tx.Query(ctx,
+			`SELECT id FROM pools WHERE home_edge=$1 OR backup_edge=$1`, string(edge))
+		if err != nil {
+			return nil, fmt.Errorf("ybstore: pools-for-dead-edge %s: %w", edge, err)
 		}
-		out = append(out, model.PoolID(id))
-	}
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("ybstore: pools-for-dead-edge rows: %w", err)
+		defer rows.Close()
+		var out []model.PoolID
+		for rows.Next() {
+			var id int64
+			if err := rows.Scan(&id); err != nil {
+				return nil, fmt.Errorf("ybstore: scan dead-edge id: %w", err)
+			}
+			out = append(out, model.PoolID(id))
+		}
+		if err := rows.Err(); err != nil {
+			return nil, fmt.Errorf("ybstore: pools-for-dead-edge rows: %w", err)
+		}
+		return out, nil
+	})
+	if err != nil {
+		return nil, err
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i] < out[j] })
 	return out, nil
@@ -714,21 +717,27 @@ func (s *Store) PoolsForDeadEdge(ctx context.Context, edge model.EdgeID) ([]mode
 // ListIDs returns every pool id, sorted — the level-triggered reconcile sweep's
 // backstop enumeration (replaces the etcd poolstore.List the sweep used).
 func (s *Store) ListIDs(ctx context.Context) ([]model.PoolID, error) {
-	rows, err := s.pool.Query(ctx, `SELECT id FROM pools`)
-	if err != nil {
-		return nil, fmt.Errorf("ybstore: list ids: %w", err)
-	}
-	defer rows.Close()
-	var out []model.PoolID
-	for rows.Next() {
-		var id int64
-		if err := rows.Scan(&id); err != nil {
-			return nil, fmt.Errorf("ybstore: scan id: %w", err)
+	out, err := followerRead(ctx, s, "list-ids", func(tx pgx.Tx) ([]model.PoolID, error) {
+		rows, err := tx.Query(ctx, `SELECT id FROM pools`)
+		if err != nil {
+			return nil, fmt.Errorf("ybstore: list ids: %w", err)
 		}
-		out = append(out, model.PoolID(id))
-	}
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("ybstore: list ids rows: %w", err)
+		defer rows.Close()
+		var out []model.PoolID
+		for rows.Next() {
+			var id int64
+			if err := rows.Scan(&id); err != nil {
+				return nil, fmt.Errorf("ybstore: scan id: %w", err)
+			}
+			out = append(out, model.PoolID(id))
+		}
+		if err := rows.Err(); err != nil {
+			return nil, fmt.Errorf("ybstore: list ids rows: %w", err)
+		}
+		return out, nil
+	})
+	if err != nil {
+		return nil, err
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i] < out[j] })
 	return out, nil
@@ -771,32 +780,34 @@ func (s *Store) Delete(ctx context.Context, id model.PoolID) error {
 
 // List returns every pool Record, sorted by id. Replaces the etcd poolstore's List.
 func (s *Store) List(ctx context.Context) ([]Record, error) {
-	rows, err := s.pool.Query(ctx, `SELECT id, body FROM pools`)
-	if err != nil {
-		return nil, fmt.Errorf("ybstore: list: %w", err)
-	}
-	defer rows.Close()
+	return followerRead(ctx, s, "list", func(tx pgx.Tx) ([]Record, error) {
+		rows, err := tx.Query(ctx, `SELECT id, body FROM pools`)
+		if err != nil {
+			return nil, fmt.Errorf("ybstore: list: %w", err)
+		}
+		defer rows.Close()
 
-	var out []Record
-	for rows.Next() {
-		var id int64
-		var body []byte
-		if err := rows.Scan(&id, &body); err != nil {
-			return nil, fmt.Errorf("ybstore: scan list body: %w", err)
+		var out []Record
+		for rows.Next() {
+			var id int64
+			var body []byte
+			if err := rows.Scan(&id, &body); err != nil {
+				return nil, fmt.Errorf("ybstore: scan list body: %w", err)
+			}
+			var rec Record
+			if err := json.Unmarshal(body, &rec); err != nil {
+				// A dropped pool is a blind spot; log LOUD with the pool id before skipping.
+				s.log.Error("ybstore: skipping malformed pool row in List", "pool", id, "err", err)
+				continue
+			}
+			out = append(out, rec)
 		}
-		var rec Record
-		if err := json.Unmarshal(body, &rec); err != nil {
-			// A dropped pool is a blind spot; log LOUD with the pool id before skipping.
-			s.log.Error("ybstore: skipping malformed pool row in List", "pool", id, "err", err)
-			continue
+		if err := rows.Err(); err != nil {
+			return nil, fmt.Errorf("ybstore: list rows: %w", err)
 		}
-		out = append(out, rec)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("ybstore: list rows: %w", err)
-	}
-	sort.Slice(out, func(i, j int) bool { return out[i].Pool.ID < out[j].Pool.ID })
-	return out, nil
+		sort.Slice(out, func(i, j int) bool { return out[i].Pool.ID < out[j].Pool.ID })
+		return out, nil
+	})
 }
 
 // MemberConflicts returns, for the given prefixes, the existing member records
@@ -914,26 +925,28 @@ func scanConflicts(rows pgx.Rows, add func(string, model.PoolID) error) error {
 // grouped aggregate, so the placement cache can refresh the whole map in a single
 // query instead of probing the ledger per edge.
 func (s *Store) UsedByEdge(ctx context.Context) (map[model.EdgeID]int64, error) {
-	rows, err := s.pool.Query(ctx,
-		`SELECT home_edge, COALESCE(SUM(cost), 0) FROM pools GROUP BY home_edge`)
-	if err != nil {
-		return nil, fmt.Errorf("ybstore: used-by-edge: %w", err)
-	}
-	defer rows.Close()
-
-	out := make(map[model.EdgeID]int64)
-	for rows.Next() {
-		var edge string
-		var used int64
-		if err := rows.Scan(&edge, &used); err != nil {
-			return nil, fmt.Errorf("ybstore: scan used-by-edge: %w", err)
+	return followerRead(ctx, s, "used-by-edge", func(tx pgx.Tx) (map[model.EdgeID]int64, error) {
+		rows, err := tx.Query(ctx,
+			`SELECT home_edge, COALESCE(SUM(cost), 0) FROM pools GROUP BY home_edge`)
+		if err != nil {
+			return nil, fmt.Errorf("ybstore: used-by-edge: %w", err)
 		}
-		out[model.EdgeID(edge)] = used
-	}
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("ybstore: used-by-edge rows: %w", err)
-	}
-	return out, nil
+		defer rows.Close()
+
+		out := make(map[model.EdgeID]int64)
+		for rows.Next() {
+			var edge string
+			var used int64
+			if err := rows.Scan(&edge, &used); err != nil {
+				return nil, fmt.Errorf("ybstore: scan used-by-edge: %w", err)
+			}
+			out[model.EdgeID(edge)] = used
+		}
+		if err := rows.Err(); err != nil {
+			return nil, fmt.Errorf("ybstore: used-by-edge rows: %w", err)
+		}
+		return out, nil
+	})
 }
 
 // nullEdge maps an empty backup edge to a NULL backup_edge (so the
@@ -952,29 +965,73 @@ func isUniqueViolation(err error) bool {
 	return errors.As(err, &pgErr) && pgErr.Code == pgerrcode.UniqueViolation
 }
 
-// maxReadRetries bounds the re-reads on a Yugabyte read-restart.
+// maxReadRetries bounds the re-reads on a Yugabyte read-restart (a rare backstop now
+// that the bulk scans run as follower reads — see followerRead).
 const maxReadRetries = 5
+
+// followerStaleMs is the follower-read staleness for the bulk scans: the read is pinned
+// to a snapshot this many ms in the PAST, so it cannot conflict with concurrent writes
+// and a large scan never trips "Restart read required". Must exceed the cluster max clock
+// skew (default ~500ms). The staleness is fine for the render/reconcile/metrics bulk
+// reads — they are level-triggered and re-run; the failover PIVOT uses the fresh
+// single-row GetForReconcile, NOT these scans.
+const followerStaleMs = 10000
 
 // isReadRestart reports whether err is a YugabyteDB/Postgres serialization failure
 // (40001, "Restart read required"). A long index scan can hit it under concurrent
 // writes, and once rows have streamed the query layer can't retry mid-flight ("query
 // layer retry isn't possible because data was already transferred"), so the caller
 // must re-run the WHOLE read. Seen at 350K: PoolsForBackup(l2) failed 122× during the
-// converge write storm, starving that edge's render.
+// converge write storm; at 5.9M it failed ALL retries and starved the render, cascading
+// into a false-failover storm (DESIGN §9.1). followerRead is the fix; this stays as a
+// cheap backstop for the (now rare) restart.
 func isReadRestart(err error) bool {
 	var pgErr *pgconn.PgError
 	return errors.As(err, &pgErr) && pgErr.Code == pgerrcode.SerializationFailure
 }
 
-// readRetry re-runs read on a read-restart (isReadRestart), up to maxReadRetries.
-func readRetry[T any](s *Store, what string, read func() (T, error)) (T, error) {
+// followerRead runs fn inside a READ ONLY transaction pinned to a stale follower-read
+// snapshot (followerStaleMs). The fixed past read point cannot conflict with concurrent
+// writes, so a large per-edge / full-table scan never trips YugabyteDB "Restart read
+// required" (40001) — the failure that starved the render and cascaded into a
+// false-failover storm at 5.9M members (DESIGN §9.1). isReadRestart is kept as a cheap
+// backstop. Use ONLY for bulk, staleness-tolerant reads; single-row pivot reads
+// (GetForReconcile) must stay fresh/leader (never wrap those).
+func followerRead[T any](ctx context.Context, s *Store, what string, fn func(pgx.Tx) (T, error)) (T, error) {
 	var out T
 	var err error
 	for attempt := 0; attempt <= maxReadRetries; attempt++ {
-		if out, err = read(); err == nil || !isReadRestart(err) {
+		out, err = followerReadOnce(ctx, s, fn)
+		if err == nil || !isReadRestart(err) {
 			return out, err
 		}
-		s.log.Warn("ybstore: read restart, retrying", "query", what, "attempt", attempt+1)
+		s.log.Warn("ybstore: read restart under follower read, retrying", "query", what, "attempt", attempt+1)
 	}
 	return out, err
+}
+
+// followerReadOnce is one attempt of followerRead: open a READ ONLY txn, enable follower
+// reads with the staleness bound, run fn, commit.
+func followerReadOnce[T any](ctx context.Context, s *Store, fn func(pgx.Tx) (T, error)) (T, error) {
+	var zero T
+	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{AccessMode: pgx.ReadOnly})
+	if err != nil {
+		return zero, fmt.Errorf("ybstore: begin follower read: %w", err)
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck
+	if _, err := tx.Exec(ctx, `SET LOCAL yb_read_from_followers = true`); err != nil {
+		return zero, fmt.Errorf("ybstore: enable follower read: %w", err)
+	}
+	// followerStaleMs is a compile-time int const → safe to inline (SET LOCAL takes no $-params).
+	if _, err := tx.Exec(ctx, fmt.Sprintf(`SET LOCAL yb_follower_read_staleness_ms = %d`, followerStaleMs)); err != nil {
+		return zero, fmt.Errorf("ybstore: set follower staleness: %w", err)
+	}
+	out, err := fn(tx)
+	if err != nil {
+		return zero, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return zero, fmt.Errorf("ybstore: commit follower read: %w", err)
+	}
+	return out, nil
 }
